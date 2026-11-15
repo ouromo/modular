@@ -513,6 +513,13 @@ public:
         llvm::StringMap<llvm::GlobalValue::LinkageTypes> &symbolLinkageTypes,
         int64_t moduleIdx, unsigned numFunctionBase);
 
+  /// When set, `split` hands out chunks of splits through this function and
+  /// does not call the per-split process function.
+  LLVMChunkProcessFn *chunkFn = nullptr;
+
+  /// The number of chunks to make when `chunkFn` is set.
+  unsigned numChunks = 1;
+
 private:
   struct ValueInfo {
     const llvm::Value *value = nullptr;
@@ -573,6 +580,20 @@ void KGEN::splitPerFunction(
   CompilerTimeTraceScope traceScope("splitPerFunction");
   LLVMModulePerFunctionSplitterImpl impl(std::move(module));
   impl.split(processFn, symbolLinkageTypes, inputModuleIdx, numFunctionBase);
+}
+
+void KGEN::splitPerFunctionChunked(
+    LLVMModuleAndContext module, LLVMChunkProcessFn chunkFn,
+    unsigned numChunks,
+    llvm::StringMap<llvm::GlobalValue::LinkageTypes> &symbolLinkageTypes) {
+  CompilerTimeTraceScope traceScope("splitPerFunctionChunked");
+  LLVMModulePerFunctionSplitterImpl impl(std::move(module));
+  impl.chunkFn = &chunkFn;
+  impl.numChunks = std::max(1u, numChunks);
+  auto unused = [](llvm::unique_function<LLVMModuleAndContext()>,
+                   std::optional<int64_t>, unsigned) {};
+  impl.split(unused, symbolLinkageTypes, /*inputModuleIdx=*/0,
+             /*numFunctionBase=*/0);
 }
 
 /// Split the LLVM module into multiple modules using the provided process
@@ -725,11 +746,36 @@ void LLVMModulePerFunctionSplitterImpl::split(
   for (const llvm::GlobalValue *value : toSplit)
     splitValue(value);
 
-  if (setsToProcess.size() <= 1)
+  if (setsToProcess.size() <= 1 && !chunkFn)
     return processFn(forwardModule(std::move(mainModule)), std::nullopt,
                      numFunctionBase);
 
   auto duplicatedFns = std::move(mainModule.duplicatedFns);
+
+  // For chunked splitting, distribute the splits over the chunks round-robin
+  // and record the names of the values each split defines. The names are
+  // taken now, because the main module is moved into the string table below.
+  struct ChunkPlan {
+    llvm::MapVector<const llvm::GlobalValue *, unsigned> values;
+    std::vector<std::vector<std::string>> splitNames;
+  };
+  std::vector<ChunkPlan> chunkPlans;
+  if (chunkFn) {
+    llvm::StringSet<> seenChunkFns;
+    chunkPlans.resize(numChunks);
+    unsigned nextChunk = 0;
+    for (auto &set : setsToProcess) {
+      removeDuplicates(set, seenChunkFns, duplicatedFns);
+      if (set.empty())
+        continue;
+      ChunkPlan &plan = chunkPlans[nextChunk++ % chunkPlans.size()];
+      std::vector<std::string> &names = plan.splitNames.emplace_back();
+      for (auto &valueAndIdx : set) {
+        names.push_back(valueAndIdx.first->getName().str());
+        plan.values.insert(valueAndIdx);
+      }
+    }
+  }
 
   // Prepare to materialize slices of the module by first writing the main
   // module as bitcode to a shared buffer.
@@ -738,6 +784,20 @@ void LLVMModulePerFunctionSplitterImpl::split(
     CompilerTimeTraceScope traceScope("writeMainModuleBitcode");
     llvm::Module &module = strtab->externalizeStrings(std::move(mainModule));
     llvm::WriteBitcodeToFile(module, *buf);
+  }
+
+  if (chunkFn) {
+    for (ChunkPlan &plan : chunkPlans) {
+      if (plan.splitNames.empty())
+        continue;
+      auto makeModule = [set = std::move(plan.values),
+                         buf = BufferRef(buf.copy()),
+                         strtab = strtab.copy()]() mutable {
+        return readAndMaterializeDependencies(std::move(buf), set, *strtab);
+      };
+      (*chunkFn)(std::move(makeModule), std::move(plan.splitNames));
+    }
+    return;
   }
 
   unsigned numFunctions = numFunctionBase;

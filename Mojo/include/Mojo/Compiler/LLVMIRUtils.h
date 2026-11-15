@@ -19,6 +19,8 @@
 #include "llvm/ADT/FunctionExtras.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/IR/Module.h"
+#include <string>
+#include <vector>
 
 namespace M::KGEN {
 
@@ -78,6 +80,23 @@ void splitPerFunction(
     LLVMModuleAndContext module, LLVMSplitProcessFn processFn,
     llvm::StringMap<llvm::GlobalValue::LinkageTypes> &symbolLinkageTypes,
     int64_t inputModuleIdx = 0, unsigned numFunctionBase = 0);
+
+/// Receives one chunk of a module split per function: a callback that
+/// materializes the chunk, and for each split in the chunk the names of the
+/// global values that the split defines.
+using LLVMChunkProcessFn =
+    function_ref<void(llvm::unique_function<LLVMModuleAndContext()>,
+                      std::vector<std::vector<std::string>>)>;
+
+/// Like `splitPerFunction`, but groups the splits into at most `numChunks`
+/// chunks. Each chunk materializes as one module that holds the definitions
+/// of all of its splits, so the bitcode of the input module is read once per
+/// chunk and not once per split. The caller carves the splits out of the
+/// chunk module.
+void splitPerFunctionChunked(
+    LLVMModuleAndContext module, LLVMChunkProcessFn chunkFn,
+    unsigned numChunks,
+    llvm::StringMap<llvm::GlobalValue::LinkageTypes> &symbolLinkageTypes);
 
 } // namespace M::KGEN
 
