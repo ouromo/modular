@@ -585,8 +585,7 @@ void KGEN::splitPerFunction(
 }
 
 void KGEN::splitPerFunctionChunked(
-    LLVMModuleAndContext module, LLVMChunkProcessFn chunkFn,
-    unsigned numChunks,
+    LLVMModuleAndContext module, LLVMChunkProcessFn chunkFn, unsigned numChunks,
     llvm::StringMap<llvm::GlobalValue::LinkageTypes> &symbolLinkageTypes) {
   CompilerTimeTraceScope traceScope("splitPerFunctionChunked");
   LLVMModulePerFunctionSplitterImpl impl(std::move(module));

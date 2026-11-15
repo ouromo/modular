@@ -94,8 +94,7 @@ using LLVMChunkProcessFn =
 /// chunk and not once per split. The caller carves the splits out of the
 /// chunk module.
 void splitPerFunctionChunked(
-    LLVMModuleAndContext module, LLVMChunkProcessFn chunkFn,
-    unsigned numChunks,
+    LLVMModuleAndContext module, LLVMChunkProcessFn chunkFn, unsigned numChunks,
     llvm::StringMap<llvm::GlobalValue::LinkageTypes> &symbolLinkageTypes);
 
 } // namespace M::KGEN
