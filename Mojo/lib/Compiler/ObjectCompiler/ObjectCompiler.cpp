@@ -61,6 +61,7 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/StandardInstrumentations.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/FileUtilities.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Process.h"
@@ -76,6 +77,7 @@
 #include "llvm/Transforms/Utils/SplitModule.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 #include <dlfcn.h>
+#include <filesystem>
 #include <fstream>
 #include <string>
 
@@ -873,6 +875,20 @@ ObjectCompiler::emitArchiveParallelCompilation(
 
   SmallVector<AsyncRT::AnyAsyncValueRef> cacheResults;
 
+  if (useSplitCache && strategy == SplitStrategy::PerFunction) {
+    uint64_t chunkIdx = 0;
+    auto handleChunk =
+        [&](llvm::unique_function<LLVMModuleAndContext()> produceChunk,
+            std::vector<std::vector<std::string>> splitNames) {
+          cacheResults.push_back(compileChunkThroughSplitCache(
+              std::move(produceChunk), std::move(splitNames), opLoc,
+              chunkIdx++));
+        };
+    splitPerFunctionChunked(std::move(llvmModule), handleChunk,
+                            options.splitCacheChunks, symbolLinkageTypes);
+    return cacheResults;
+  }
+
   if (noSplitting || strategy == SplitStrategy::None) {
     cacheResults.push_back(lowerLLVMModuleToObjects(
         forwardModule(std::move(llvmModule)), opLoc, targetMachine, parLLC,
@@ -907,6 +923,10 @@ ErrorOr<WriteableBufferRef> ObjectCompiler::emitArchiveMCLinking(
       return Error(result.takeDiagnostic().getMessage().get());
   }
   CompilerTimeTraceScope traceScope("concatenate-object-files");
+
+  // The splits of a split cache build are object files already.
+  if (useSplitCache && !splitCacheObjects.empty())
+    return linkSplitCacheObjects();
 
   // Link MC before printing.
   auto machineOr = createTargetMachine(options, /*isJIT=*/isJIT);
@@ -1021,6 +1041,18 @@ ErrorOr<BufferRef> ObjectCompiler::emitArchive(OwningOpRef<ModuleOp> module,
                                                std::string *outKeyHash) {
   LLVMTimingRegion timingRegion(options);
   CompilerTimeTraceScope traceScope("produce-archive");
+
+  // The split cache keeps object files, so it serves builds that emit object
+  // code only. A build that saves its temporary files needs the whole module.
+  useSplitCache = !options.splitCacheDir.empty() && !isJIT && !emitAssembly &&
+                  options.saveTempsPrefix.empty();
+  splitCacheObjects.clear();
+  if (useSplitCache) {
+    if (std::error_code ec =
+            llvm::sys::fs::create_directories(options.splitCacheDir))
+      return Error("failed to create the split cache directory '" +
+                   options.splitCacheDir + "': " + ec.message());
+  }
 
   auto tmOr = createTargetMachine(options, isJIT);
   if (failed(tmOr))
@@ -1236,6 +1268,249 @@ ObjectCompiler::lowerLLVMModuleToObjects(
       });
 
   return result;
+}
+
+//===----------------------------------------------------------------------===//
+// Split cache
+//===----------------------------------------------------------------------===//
+
+/// Make the module of one split from its chunk: the definitions of the values
+/// named in `names`, and declarations of what they use.
+static std::unique_ptr<llvm::Module>
+carveSplitModule(llvm::Module &chunk, const std::vector<std::string> &names) {
+  llvm::StringSet<> members;
+  for (const std::string &name : names)
+    members.insert(name);
+
+  llvm::ValueToValueMapTy valueMap;
+  std::unique_ptr<llvm::Module> split = llvm::CloneModule(
+      chunk, valueMap, [&](const llvm::GlobalValue *value) {
+        return members.contains(value->getName());
+      });
+
+  // Drop the declarations that the split does not use. The ones that stay
+  // are external, and they must not be DSO local; see
+  // `readAndMaterializeDependencies`.
+  for (llvm::GlobalVariable &global :
+       llvm::make_early_inc_range(split->globals())) {
+    if (!global.isDeclaration())
+      continue;
+    if (global.use_empty())
+      global.eraseFromParent();
+    else
+      global.setDSOLocal(false);
+  }
+  for (llvm::Function &func : llvm::make_early_inc_range(*split)) {
+    if (!func.isDeclaration())
+      continue;
+    if (func.use_empty())
+      func.eraseFromParent();
+    else
+      func.setDSOLocal(false);
+  }
+  return split;
+}
+
+AsyncRT::AsyncValueRef<SymbolAndMCInfo>
+ObjectCompiler::compileChunkThroughSplitCache(
+    llvm::unique_function<LLVMModuleAndContext()> produceChunk,
+    std::vector<std::vector<std::string>> splitNames, Location loc,
+    uint64_t chunkIdx) {
+  auto result = AsyncRT::AsyncValueRef<SymbolAndMCInfo>::allocate(cpuDevice);
+
+  cpuDevice.getWorkQueue()->addTask(
+      [this, result = result.copy(), produceChunk = std::move(produceChunk),
+       splitNames = std::move(splitNames), loc, chunkIdx]() mutable {
+        CompilerTimeTraceScope traceScope("splitCacheChunkTask");
+        auto fail = [&](const Twine &message) {
+          return std::move(result).setToError(
+              AsyncRT::getMLIRDiagnostic(message, loc));
+        };
+
+        LLVMModuleAndContext chunk = produceChunk();
+
+        struct PendingSplit {
+          std::string path;
+          std::unique_ptr<llvm::Module> module;
+        };
+        std::vector<PendingSplit> pending;
+
+        // Hash every split of the chunk before any split is compiled. The
+        // optimization registers metadata kinds in the LLVM context that the
+        // splits share, and the bitcode writer emits all kinds of the
+        // context. A split carved after a compilation would thus get another
+        // hash than the same split in a build that compiles nothing.
+        for (auto [splitIdx, names] : llvm::enumerate(splitNames)) {
+          std::unique_ptr<llvm::Module> split = carveSplitModule(*chunk, names);
+
+          std::string key;
+          {
+            llvm::raw_string_ostream os(key);
+            options.print(os << "splitCache-v1(");
+            os << ")";
+            llvm::WriteBitcodeToFile(*split, os);
+          }
+          auto hash = llvm::SHA256::hash(llvm::ArrayRef<uint8_t>(
+              reinterpret_cast<const uint8_t *>(key.data()), key.size()));
+          std::string path =
+              (Twine(options.splitCacheDir) + "/" +
+               llvm::toHex(llvm::ArrayRef<uint8_t>(hash.data(), 16)) + ".o")
+                  .str();
+
+          if (llvm::sys::fs::exists(path)) {
+            // Mark the object as used, for the removal of the oldest objects.
+            std::error_code ec;
+            std::filesystem::last_write_time(
+                path, std::filesystem::file_time_type::clock::now(), ec);
+          } else {
+            pending.push_back({path, std::move(split)});
+          }
+
+          std::lock_guard<std::mutex> lock(splitCacheMutex);
+          splitCacheObjects.push_back({(chunkIdx << 32) | splitIdx, path});
+        }
+
+        if (pending.empty()) {
+          std::move(result).emplace(SymbolAndMCInfo());
+          return;
+        }
+
+        auto optTmOr = createTargetMachine(options, isJIT);
+        if (failed(optTmOr))
+          return std::move(result).setToError(
+              AsyncRT::getMLIRDiagnostic(optTmOr.takeError(), loc));
+
+        for (PendingSplit &job : pending) {
+          if (failed(optimizeLLVMModule(*job.module, **optTmOr, options,
+                                        cpuDevice, std::nullopt)))
+            return fail("failed to optimize LLVM IR.");
+
+          // Each code generation needs its own target machine.
+          auto llcTmOr = createTargetMachine(options, isJIT);
+          if (failed(llcTmOr))
+            return std::move(result).setToError(
+                AsyncRT::getMLIRDiagnostic(llcTmOr.takeError(), loc));
+
+          auto object = WriteableBuffer::get();
+          std::unique_ptr<llvm::MachineModuleInfo> machineModuleInfo;
+          std::unique_ptr<llvm::MCContext> mcContext;
+          if (failed(runLlcPasses(*job.module, options, **llcTmOr, *object,
+                                  machineModuleInfo, mcContext,
+                                  llvm::CodeGenFileType::ObjectFile,
+                                  /*stopBeforeAsmPrint=*/false)))
+            return fail("llc failed to codegen LLVM IR to object code");
+
+          // Write to a temporary file and rename it, so that another build
+          // never reads a partial object.
+          llvm::SmallString<128> tmpPath;
+          if (llvm::sys::fs::createUniqueFile(job.path + ".%%%%%%%%.tmp",
+                                              tmpPath))
+            return fail("failed to create a file in the split cache");
+          std::error_code ec;
+          {
+            llvm::raw_fd_ostream out(tmpPath, ec);
+            if (!ec)
+              out.write(object->getBufferStart(), object->getBufferSize());
+          }
+          if (ec || llvm::sys::fs::rename(tmpPath, job.path))
+            return fail("failed to write an object to the split cache");
+          job.module.reset();
+        }
+
+        std::move(result).emplace(SymbolAndMCInfo());
+      });
+
+  return result;
+}
+
+ErrorOr<WriteableBufferRef> ObjectCompiler::linkSplitCacheObjects() {
+  CompilerTimeTraceScope traceScope("linkSplitCacheObjects");
+  std::lock_guard<std::mutex> lock(splitCacheMutex);
+
+  // The tasks finish in any order; the position gives a stable link order.
+  llvm::sort(splitCacheObjects);
+
+  llvm::SmallString<128> rspPath, outPath;
+  if (llvm::sys::fs::createUniqueFile(
+          Twine(options.splitCacheDir) + "/link-%%%%%%%%.rsp", rspPath) ||
+      llvm::sys::fs::createUniqueFile(
+          Twine(options.splitCacheDir) + "/link-%%%%%%%%.o", outPath))
+    return Error("failed to create a file in the split cache");
+  llvm::FileRemover removeRsp(rspPath), removeOut(outPath);
+
+  {
+    std::error_code ec;
+    llvm::raw_fd_ostream rsp(rspPath, ec);
+    if (ec)
+      return Error("failed to write the response file of the split cache");
+    for (auto &[position, path] : splitCacheObjects)
+      rsp << path << '\n';
+  }
+
+  // Combine the objects into one relocatable object. The splitter gave weak
+  // linkage to the symbols that more than one split defines, so the linker
+  // keeps one definition of each.
+  llvm::ErrorOr<std::string> ld = llvm::sys::findProgramByName("ld");
+  if (!ld)
+    return Error("the split cache needs `ld` to combine object files");
+  std::string rspArg = ("@" + rspPath).str();
+  StringRef args[] = {*ld, "-r", "-o", outPath, rspArg};
+  std::string errorMsg;
+  if (llvm::sys::ExecuteAndWait(*ld, args, /*Env=*/std::nullopt,
+                                /*Redirects=*/{}, /*SecondsToWait=*/0,
+                                /*MemoryLimit=*/0, &errorMsg))
+    return Error("failed to combine the objects of the split cache" +
+                 (errorMsg.empty() ? "" : ": " + errorMsg));
+
+  auto fileOr = llvm::MemoryBuffer::getFile(outPath);
+  if (!fileOr)
+    return Error("failed to read the combined object of the split cache");
+  WriteableBufferRef linked = WriteableBuffer::get();
+  *linked << (*fileOr)->getBuffer();
+  splitCacheObjects.clear();
+
+  // Remove the oldest objects if the cache is over its size limit. A hit
+  // renews the time of an object, so the objects of this build go last.
+  if (options.splitCacheMaxBytes != 0) {
+    struct CachedObject {
+      std::filesystem::file_time_type time;
+      uint64_t size;
+      std::filesystem::path path;
+    };
+    std::vector<CachedObject> objects;
+    uint64_t totalSize = 0;
+    std::error_code ec;
+    for (std::filesystem::directory_iterator
+             it(options.splitCacheDir, ec),
+         end;
+         !ec && it != end; it.increment(ec)) {
+      if (it->path().extension() != ".o")
+        continue;
+      std::error_code entryEc;
+      uint64_t size = it->file_size(entryEc);
+      auto time = it->last_write_time(entryEc);
+      if (entryEc)
+        continue;
+      objects.push_back({time, size, it->path()});
+      totalSize += size;
+    }
+    if (totalSize > options.splitCacheMaxBytes) {
+      llvm::sort(objects, [](const CachedObject &lhs, const CachedObject &rhs) {
+        return lhs.time < rhs.time;
+      });
+      // Go some way under the limit, so that not every build removes files.
+      uint64_t target = options.splitCacheMaxBytes / 10 * 8;
+      for (const CachedObject &object : objects) {
+        if (totalSize <= target)
+          break;
+        std::error_code removeEc;
+        if (std::filesystem::remove(object.path, removeEc))
+          totalSize -= object.size;
+      }
+    }
+  }
+
+  return linked;
 }
 
 //===----------------------------------------------------------------------===//

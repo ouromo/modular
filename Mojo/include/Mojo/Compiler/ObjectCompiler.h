@@ -27,7 +27,9 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/ModuleSummaryIndex.h"
 #include <filesystem>
+#include <mutex>
 #include <string>
+#include <vector>
 
 namespace llvm {
 class LLVMContext;
@@ -148,6 +150,21 @@ private:
   /// Generate saveTempsPrefix files.
   ErrorOrSuccess emitArchiveSaveTemps(ModuleOp module, StringRef moduleName);
 
+  /// Compile one chunk of a module split per function through the split
+  /// cache. `splitNames` holds, for each split of the chunk, the names of the
+  /// values it defines. Each split is carved out of the chunk module and
+  /// hashed; a split whose object file is not in the cache is optimized and
+  /// compiled. The paths of the object files go to `splitCacheObjects`.
+  AsyncRT::AsyncValueRef<SymbolAndMCInfo> compileChunkThroughSplitCache(
+      llvm::unique_function<LLVMModuleAndContext()> produceChunk,
+      std::vector<std::vector<std::string>> splitNames, Location loc,
+      uint64_t chunkIdx);
+
+  /// Combine the object files in `splitCacheObjects` into one relocatable
+  /// object file, and then remove the oldest objects of the cache if it is
+  /// over its size limit.
+  ErrorOr<WriteableBufferRef> linkSplitCacheObjects();
+
   /// The caches needed for compilation.
   RCRef<Cache::TransformCache> transformCache;
 
@@ -183,6 +200,16 @@ private:
   /// Mutex to protect deduplicating TargetMachine to save peak memory
   /// footprint.
   std::mutex tmMutex;
+
+  /// True while `emitArchive` builds through the split cache.
+  bool useSplitCache = false;
+
+  /// Mutex to protect `splitCacheObjects`.
+  std::mutex splitCacheMutex;
+
+  /// The object file of each split of the current build, with the position
+  /// of the split, which gives the link order.
+  std::vector<std::pair<uint64_t, std::string>> splitCacheObjects;
 
   /// Name of the system linker.
   std::string linker;
