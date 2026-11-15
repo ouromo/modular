@@ -1289,7 +1289,7 @@ carveSplitModule(llvm::Module &chunk, const std::vector<std::string> &names) {
       });
 
   // Drop the declarations that the split does not use. The ones that stay
-  // are external, and they must not be DSO local; see
+  // are external, and they must not be DSO local unless they are hidden; see
   // `readAndMaterializeDependencies`.
   for (llvm::GlobalVariable &global :
        llvm::make_early_inc_range(split->globals())) {
@@ -1297,7 +1297,7 @@ carveSplitModule(llvm::Module &chunk, const std::vector<std::string> &names) {
       continue;
     if (global.use_empty())
       global.eraseFromParent();
-    else
+    else if (!global.hasHiddenVisibility())
       global.setDSOLocal(false);
   }
   for (llvm::Function &func : llvm::make_early_inc_range(*split)) {
@@ -1305,7 +1305,7 @@ carveSplitModule(llvm::Module &chunk, const std::vector<std::string> &names) {
       continue;
     if (func.use_empty())
       func.eraseFromParent();
-    else
+    else if (!func.hasHiddenVisibility())
       func.setDSOLocal(false);
   }
   return split;

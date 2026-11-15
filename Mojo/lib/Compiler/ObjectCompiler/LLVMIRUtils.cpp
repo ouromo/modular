@@ -254,7 +254,8 @@ static LLVMModuleAndContext readAndMaterializeDependencies(
       // `R_X86_64_PC32` instead of `R_X86_64_REX_GOTPCRELX`
       // for these symbols and building shared library from
       // a static archive of this module will error with an `fPIC` confusion.
-      global.setDSOLocal(false);
+      if (!global.hasHiddenVisibility())
+        global.setDSOLocal(false);
     }
     ++curIdx;
   }
@@ -273,7 +274,8 @@ static LLVMModuleAndContext readAndMaterializeDependencies(
       // a static archive of this module will error with an `fPIC` confusion.
       // External link should not be DSOLocal anymore,
       // otherwise position independent code generation get confused.
-      func.setDSOLocal(false);
+      if (!func.hasHiddenVisibility())
+        func.setDSOLocal(false);
     }
     ++curIdx;
   }
@@ -710,6 +712,11 @@ void LLVMModulePerFunctionSplitterImpl::split(
 
       symbolLinkageTypes.insert({global.getName().str(), global.getLinkage()});
       global.setLinkage(llvm::GlobalValue::WeakAnyLinkage);
+      // In chunked mode a system linker combines the splits and nothing
+      // restores the local linkage, so keep the symbol out of the dynamic
+      // symbol table and let the code refer to it directly.
+      if (chunkFn)
+        global.setVisibility(llvm::GlobalValue::HiddenVisibility);
       continue;
     }
 
@@ -733,6 +740,8 @@ void LLVMModulePerFunctionSplitterImpl::split(
       // Avoid renaming when linking in MCLink.
       symbolLinkageTypes.insert({fn.getName().str(), fn.getLinkage()});
       fn.setLinkage(llvm::Function::LinkageTypes::WeakAnyLinkage);
+      if (chunkFn)
+        fn.setVisibility(llvm::GlobalValue::HiddenVisibility);
     }
 
     if (info.canBeSplit || info.userEmpty) {
