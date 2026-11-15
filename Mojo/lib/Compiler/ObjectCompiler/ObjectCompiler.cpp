@@ -1288,6 +1288,12 @@ carveSplitModule(llvm::Module &chunk, const std::vector<std::string> &names) {
         return members.contains(value->getName());
       });
 
+  // The name of the main source file must not be part of the cache key or
+  // of the object file, so that programs share the objects of the functions
+  // they have in common.
+  split->setModuleIdentifier("split");
+  split->setSourceFileName("");
+
   // Drop the declarations that the split does not use. The ones that stay
   // are external, and they must not be DSO local unless they are hidden; see
   // `readAndMaterializeDependencies`.
