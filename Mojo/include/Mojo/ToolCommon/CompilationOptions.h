@@ -247,6 +247,21 @@ public:
   bool enableLLVMPerFunctionSplitting = false;
   bool enableParallelLLC = true;
 
+  /// The directory of the split cache. When it is not empty, a host archive
+  /// build splits the LLVM module per function before optimization and keeps
+  /// the object file of each split in this directory, under a hash of the
+  /// bitcode of the split. A later build optimizes and compiles only the
+  /// splits whose bitcode changed.
+  std::string splitCacheDir;
+
+  /// The number of chunks the LLVM module is read in when the split cache is
+  /// on. Each chunk is one task.
+  unsigned splitCacheChunks = 64;
+
+  /// The size in bytes above which the split cache removes its oldest
+  /// objects after a build. Zero means no limit.
+  uint64_t splitCacheMaxBytes = 4ull << 30;
+
   std::string emissionOptions;
 
   /// Extra options forwarded from `kgen.compile_offload`'s

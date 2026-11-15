@@ -903,6 +903,12 @@ static int build(const State &subcommandState) {
           args, options::OPT_timing_json, options::OPT_timing_file))
     return state.reportError(err.getError());
 
+  // The split cache needs the per-function splitting of the LLVM module.
+  if (llvm::opt::Arg *arg = args.getLastArg(options::OPT_split_cache_dir)) {
+    options.splitCacheDir = arg->getValue();
+    options.enableLLVMPerFunctionSplitting = true;
+  }
+
   // Before the CPU device, because the option pins the thread count to one;
   // before the MLIR timing, so the MLIR report comes out first.
   LLVMPassTiming llvmTiming;

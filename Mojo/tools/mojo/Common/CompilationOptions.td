@@ -187,6 +187,16 @@ defm timing_file: CommandOptionHidden<["--", "-"], "timing-file",
     "Writes the timing reports to FILE rather than to stderr. The reports are "
     "text, or JSON with `--timing-json`.">>;
 
+defm split_cache_dir: CommandOptionHidden<["--", "-"], "split-cache-dir",
+  CompilationOptionGroup, Index<23>, MetaVarName<"DIR">,
+  HelpText<
+    "Keeps the object code of each function in DIR and reuses it in later "
+    "builds. The compiler splits the LLVM module per function before the "
+    "LLVM optimization, and it optimizes and compiles only the functions "
+    "whose LLVM IR changed. LLVM then does not inline across functions, so "
+    "the program is slower than a default build. Use this option for "
+    "development builds. Only `mojo build` reads it.">>;
+
 //===----------------------------------------------------------------------===//
 // Linker Options
 //===----------------------------------------------------------------------===//
