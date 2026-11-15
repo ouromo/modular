@@ -197,6 +197,13 @@ defm split_cache_dir: CommandOptionHidden<["--", "-"], "split-cache-dir",
     "the program is slower than a default build. Use this option for "
     "development builds. Only `mojo build` reads it.">>;
 
+defm split_cache_max_size: CommandOptionHidden<["--", "-"],
+  "split-cache-max-size", CompilationOptionGroup, Index<24>, MetaVarName<"MB">,
+  HelpText<
+    "Sets the size in megabytes above which a build with `--split-cache-dir` "
+    "removes the oldest objects from the cache. The default is 4096. The "
+    "value 0 turns the removal off.">>;
+
 //===----------------------------------------------------------------------===//
 // Linker Options
 //===----------------------------------------------------------------------===//

@@ -908,6 +908,14 @@ static int build(const State &subcommandState) {
     options.splitCacheDir = arg->getValue();
     options.enableLLVMPerFunctionSplitting = true;
   }
+  if (llvm::opt::Arg *arg = args.getLastArg(options::OPT_split_cache_max_size)) {
+    uint64_t megabytes = 0;
+    if (StringRef(arg->getValue()).getAsInteger(10, megabytes))
+      return state.reportError(
+          "invalid value for `--split-cache-max-size`: '" +
+          Twine(arg->getValue()) + "'");
+    options.splitCacheMaxBytes = megabytes << 20;
+  }
 
   // Before the CPU device, because the option pins the thread count to one;
   // before the MLIR timing, so the MLIR report comes out first.

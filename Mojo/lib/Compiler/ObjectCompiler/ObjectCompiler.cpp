@@ -1484,7 +1484,9 @@ ErrorOr<WriteableBufferRef> ObjectCompiler::linkSplitCacheObjects() {
              it(options.splitCacheDir, ec),
          end;
          !ec && it != end; it.increment(ec)) {
-      if (it->path().extension() != ".o")
+      // Skip the combined objects that this or another build is linking.
+      if (it->path().extension() != ".o" ||
+          it->path().filename().string().starts_with("link-"))
         continue;
       std::error_code entryEc;
       uint64_t size = it->file_size(entryEc);
