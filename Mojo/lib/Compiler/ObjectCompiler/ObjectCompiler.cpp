@@ -52,6 +52,7 @@
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/CodeGen/MachineModuleInfo.h"
+#include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/IR/Verifier.h"
@@ -1276,6 +1277,62 @@ ObjectCompiler::lowerLLVMModuleToObjects(
 
 /// Make the module of one split from its chunk: the definitions of the values
 /// named in `names`, and declarations of what they use.
+/// Remove from `llvm.dbg.cu` the compile units that nothing in `module`
+/// uses. `CloneModule` copies every compile unit into every split, and the
+/// unit of the main source file holds the path of that file, so each split
+/// would depend on the program and on the directory it is built in.
+static void dropUnusedCompileUnits(llvm::Module &module) {
+  llvm::NamedMDNode *units = module.getNamedMetadata("llvm.dbg.cu");
+  if (!units || units->getNumOperands() < 2)
+    return;
+
+  llvm::SmallPtrSet<const llvm::Metadata *, 4> used;
+  auto useScope = [&](const llvm::DILocalScope *scope) {
+    if (!scope)
+      return;
+    if (const llvm::DISubprogram *subprogram = scope->getSubprogram())
+      if (subprogram->getUnit())
+        used.insert(subprogram->getUnit());
+  };
+  auto useLocation = [&](const llvm::DILocation *location) {
+    for (; location; location = location->getInlinedAt())
+      useScope(location->getScope());
+  };
+  for (const llvm::GlobalVariable &global : module.globals()) {
+    // The debug info of a global hangs off its compile unit; keep them all.
+    if (global.hasMetadata(llvm::LLVMContext::MD_dbg))
+      return;
+  }
+  for (const llvm::Function &func : module) {
+    if (const llvm::DISubprogram *subprogram = func.getSubprogram())
+      if (subprogram->getUnit())
+        used.insert(subprogram->getUnit());
+    for (const llvm::BasicBlock &block : func) {
+      for (const llvm::Instruction &inst : block) {
+        useLocation(inst.getDebugLoc().get());
+        for (const llvm::DbgRecord &record : inst.getDbgRecordRange())
+          useLocation(record.getDebugLoc().get());
+      }
+    }
+  }
+
+  llvm::SmallVector<llvm::MDNode *, 4> kept;
+  for (llvm::MDNode *node : units->operands()) {
+    auto *unit = llvm::cast<llvm::DICompileUnit>(node);
+    // A unit can also hold entities that no function refers to.
+    if (used.contains(unit) || !unit->getEnumTypes().empty() ||
+        !unit->getRetainedTypes().empty() ||
+        !unit->getGlobalVariables().empty() ||
+        !unit->getImportedEntities().empty())
+      kept.push_back(unit);
+  }
+  if (kept.size() == units->getNumOperands())
+    return;
+  units->clearOperands();
+  for (llvm::MDNode *unit : kept)
+    units->addOperand(unit);
+}
+
 static std::unique_ptr<llvm::Module>
 carveSplitModule(llvm::Module &chunk, const std::vector<std::string> &names) {
   llvm::StringSet<> members;
@@ -1293,6 +1350,7 @@ carveSplitModule(llvm::Module &chunk, const std::vector<std::string> &names) {
   // they have in common.
   split->setModuleIdentifier("split");
   split->setSourceFileName("");
+  dropUnusedCompileUnits(*split);
 
   // Drop the declarations that the split does not use. The ones that stay
   // are external, and they must not be DSO local unless they are hidden; see
