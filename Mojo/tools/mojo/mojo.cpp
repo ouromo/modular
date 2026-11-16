@@ -115,8 +115,12 @@ int main(int argc, char **argv) {
     // Print the version and exit.
     ProjectVersion version = getMojoVersion();
     const char *versionStr = getMojoVersionString();
-    llvm::outs() << llvm::formatv("Mojo {0} ({1})\n", versionStr,
-                                  version.revision);
+    // This is a modified build; do not present it as the official compiler.
+    (void)version;
+    llvm::outs() << llvm::formatv(
+        "ouromo 1.2.0.1 (experimental, do not use; modified build of the "
+        "Mojo {0} compiler)\n",
+        versionStr);
     return 0;
   }
   case options::OPT_print_cache_location: {

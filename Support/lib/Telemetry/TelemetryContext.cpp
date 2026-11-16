@@ -297,18 +297,16 @@ bool M::Telemetry::isModularEndpoint(StringRef endpoint) {
 }
 
 bool M::Telemetry::isTelemetryEnabled(Config &settings) {
-  return settings.getValueAsBool("telemetry.enabled",
-#ifdef MODULAR_PRODUCTION
-                                 true
-#else
-                                 false
-#endif // MODULAR_PRODUCTION
-  );
+  // This is a modified build: it must not send telemetry or crash reports
+  // to the vendor of the original compiler, whatever the configuration says.
+  (void)settings;
+  return false;
 }
 
 bool M::Telemetry::isCrashReportingEnabled(Config &settings) {
-  return settings.getValueAsBool("crash_reporting.enabled",
-                                 isTelemetryEnabled(settings));
+  // See `isTelemetryEnabled`.
+  (void)settings;
+  return false;
 }
 
 static size_t getMaxProcessors(const HostMachineInfo &hostInfo) {
