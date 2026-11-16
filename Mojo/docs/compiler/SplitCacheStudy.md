@@ -18,8 +18,8 @@ slower overall (up to 13% in one hot path) and are 8 to 34% larger. We think
 that cost is too high for the mode to be used as it is, so this is a study
 and not a proposal.
 
-The patch is 445 lines over 7 files on `mojo/v1.2.0`, and it is the rest of
-this branch: https://github.com/ouromo/modular/tree/split-cache
+The patch adds 503 lines over 7 files on `mojo/v1.2.0`, and it is the rest of
+this branch: https://github.com/ouromo/modular/tree/split-cache-study
 
     mojo build --split-cache-dir DIR [--split-cache-max-size MB] app.mojo
 
