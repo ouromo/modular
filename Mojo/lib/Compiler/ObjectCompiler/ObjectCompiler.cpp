@@ -862,6 +862,8 @@ ObjectCompiler::lowerAllFuncsToLLVM(llvm::LLVMContext &ctx, ModuleOp module) {
   return llvmModule;
 }
 
+static void nameConstantsByContent(llvm::Module &module);
+
 SmallVector<AsyncRT::AnyAsyncValueRef>
 ObjectCompiler::emitArchiveParallelCompilation(
     LLVMModuleAndContext llvmModule, Location opLoc,
@@ -882,6 +884,7 @@ ObjectCompiler::emitArchiveParallelCompilation(
   SmallVector<AsyncRT::AnyAsyncValueRef> cacheResults;
 
   if (useSplitCache && strategy == SplitStrategy::PerFunction) {
+    nameConstantsByContent(*llvmModule);
     uint64_t chunkIdx = 0;
     auto handleChunk =
         [&](llvm::unique_function<LLVMModuleAndContext()> produceChunk,
@@ -1053,6 +1056,7 @@ ErrorOr<BufferRef> ObjectCompiler::emitArchive(OwningOpRef<ModuleOp> module,
   useSplitCache = !options.splitCacheDir.empty() && !isJIT && !emitAssembly &&
                   options.saveTempsPrefix.empty();
   splitCacheObjects.clear();
+  splitCacheManifestLines.clear();
   if (useSplitCache) {
     if (std::error_code ec =
             llvm::sys::fs::create_directories(options.splitCacheDir))
@@ -1338,6 +1342,94 @@ static void dropUnusedCompileUnits(llvm::Module &module) {
     units->addOperand(unit);
 }
 
+/// Name the numbered constants of the module after their content. The
+/// lowering names them `global_constant`, `global_constant_0` and so on in
+/// the order of the program, so the same constant has another name in another
+/// program, and two programs give the same name to different constants. The
+/// splitter makes these symbols weak, so objects of two programs must not
+/// disagree about what a name holds.
+static void nameConstantsByContent(llvm::Module &module) {
+  for (llvm::GlobalVariable &global :
+       llvm::make_early_inc_range(module.globals())) {
+    StringRef suffix = global.getName();
+    if (!suffix.consume_front("global_constant"))
+      continue;
+    if (!suffix.empty() &&
+        !(suffix.consume_front("_") && !suffix.empty() &&
+          llvm::all_of(suffix, [](char c) { return c >= '0' && c <= '9'; })))
+      continue;
+    if (!global.hasInitializer() || !global.isConstant())
+      continue;
+
+    std::string text;
+    {
+      llvm::raw_string_ostream os(text);
+      global.getValueType()->print(os);
+      os << " align " << global.getAlign().valueOrOne().value() << " section "
+         << global.getSection() << " ";
+      global.getInitializer()->print(os);
+    }
+    auto hash = llvm::SHA256::hash(llvm::ArrayRef<uint8_t>(
+        reinterpret_cast<const uint8_t *>(text.data()), text.size()));
+    std::string name =
+        "global_constant_" +
+        llvm::toHex(llvm::ArrayRef<uint8_t>(hash.data(), 8), /*LowerCase=*/true);
+
+    llvm::GlobalVariable *same =
+        module.getGlobalVariable(name, /*AllowInternal=*/true);
+    if (same && same != &global) {
+      global.replaceAllUsesWith(same);
+      global.eraseFromParent();
+    } else {
+      global.setName(name);
+    }
+  }
+}
+
+/// Put the global variables, the functions and the debug compile units of a
+/// split in the order of their names. `CloneModule` keeps the order of the
+/// program, so without this the bitcode of a split, and with it the cache
+/// key and the layout of the object file, would depend on what else the
+/// program holds.
+static void sortSplitModule(llvm::Module &module) {
+  auto byName = [](const llvm::GlobalValue *lhs, const llvm::GlobalValue *rhs) {
+    return lhs->getName() < rhs->getName();
+  };
+
+  std::vector<llvm::GlobalVariable *> globals;
+  for (llvm::GlobalVariable &global : module.globals())
+    globals.push_back(&global);
+  llvm::stable_sort(globals, byName);
+  for (llvm::GlobalVariable *global : globals) {
+    module.removeGlobalVariable(global);
+    module.insertGlobalVariable(global);
+  }
+
+  std::vector<llvm::Function *> funcs;
+  for (llvm::Function &func : module)
+    funcs.push_back(&func);
+  llvm::stable_sort(funcs, byName);
+  for (llvm::Function *func : funcs) {
+    func->removeFromParent();
+    module.getFunctionList().push_back(func);
+  }
+
+  if (llvm::NamedMDNode *units = module.getNamedMetadata("llvm.dbg.cu")) {
+    std::vector<llvm::MDNode *> sorted(units->op_begin(), units->op_end());
+    auto unitKey = [](const llvm::MDNode *node) {
+      auto *unit = llvm::cast<llvm::DICompileUnit>(node);
+      return std::make_pair(unit->getDirectory(), unit->getFilename());
+    };
+    llvm::stable_sort(sorted,
+                      [&](const llvm::MDNode *lhs, const llvm::MDNode *rhs) {
+                        return unitKey(lhs) < unitKey(rhs);
+                      });
+    units->clearOperands();
+    for (llvm::MDNode *unit : sorted)
+      units->addOperand(unit);
+  }
+}
+
 static std::unique_ptr<llvm::Module>
 carveSplitModule(llvm::Module &chunk, const std::vector<std::string> &names) {
   llvm::StringSet<> members;
@@ -1377,6 +1469,7 @@ carveSplitModule(llvm::Module &chunk, const std::vector<std::string> &names) {
     else if (!func.hasHiddenVisibility())
       func.setDSOLocal(false);
   }
+  sortSplitModule(*split);
   return split;
 }
 
@@ -1415,18 +1508,35 @@ ObjectCompiler::compileChunkThroughSplitCache(
           std::string key;
           {
             llvm::raw_string_ostream os(key);
-            options.print(os << "splitCache-v1(");
+            options.print(os << "splitCache-v2(");
             os << ")";
             llvm::WriteBitcodeToFile(*split, os);
           }
           auto hash = llvm::SHA256::hash(llvm::ArrayRef<uint8_t>(
               reinterpret_cast<const uint8_t *>(key.data()), key.size()));
-          std::string path =
-              (Twine(options.splitCacheDir) + "/" +
-               llvm::toHex(llvm::ArrayRef<uint8_t>(hash.data(), 16)) + ".o")
-                  .str();
+          std::string name =
+              llvm::toHex(llvm::ArrayRef<uint8_t>(hash.data(), 16)) + ".o";
+          std::string path = (Twine(options.splitCacheDir) + "/" + name).str();
 
-          if (llvm::sys::fs::exists(path)) {
+          // For the study of the cache keys: the IR of every split as text.
+          if (const char *dumpDir = ::getenv("OUROMO_SPLIT_CACHE_DUMP_DIR")) {
+            std::error_code dumpEc;
+            llvm::raw_fd_ostream dump(
+                (Twine(dumpDir) + "/" + name + ".ll").str(), dumpEc);
+            if (!dumpEc)
+              split->print(dump, nullptr);
+          }
+
+          // An object of the base directory is used where it is; the base
+          // directory is never written.
+          std::string basePath;
+          if (!options.splitCacheBaseDir.empty())
+            basePath = (Twine(options.splitCacheBaseDir) + "/" + name).str();
+
+          if (!basePath.empty() && !llvm::sys::fs::exists(path) &&
+              llvm::sys::fs::exists(basePath)) {
+            path = basePath;
+          } else if (llvm::sys::fs::exists(path)) {
             // Mark the object as used, for the removal of the oldest objects.
             std::error_code ec;
             std::filesystem::last_write_time(
@@ -1437,6 +1547,13 @@ ObjectCompiler::compileChunkThroughSplitCache(
 
           std::lock_guard<std::mutex> lock(splitCacheMutex);
           splitCacheObjects.push_back({(chunkIdx << 32) | splitIdx, path});
+          if (!options.splitCacheManifest.empty()) {
+            std::string line = name;
+            for (const std::string &valueName : names)
+              line += "\t" + valueName;
+            splitCacheManifestLines.push_back(
+                {(chunkIdx << 32) | splitIdx, std::move(line)});
+          }
         }
 
         if (pending.empty()) {
@@ -1534,6 +1651,19 @@ ErrorOr<WriteableBufferRef> ObjectCompiler::linkSplitCacheObjects() {
   auto fileOr = llvm::MemoryBuffer::getFile(outPath);
   if (!fileOr)
     return Error("failed to read the combined object of the split cache");
+
+  // The manifest: one line for each split in link order, with the file name
+  // of its object and the names of the values it defines.
+  if (!options.splitCacheManifest.empty()) {
+    llvm::sort(splitCacheManifestLines);
+    std::error_code ec;
+    llvm::raw_fd_ostream manifest(options.splitCacheManifest, ec);
+    if (ec)
+      return Error("failed to write the manifest of the split cache");
+    for (auto &[position, line] : splitCacheManifestLines)
+      manifest << line << '\n';
+    splitCacheManifestLines.clear();
+  }
   WriteableBufferRef linked = WriteableBuffer::get();
   *linked << (*fileOr)->getBuffer();
   splitCacheObjects.clear();

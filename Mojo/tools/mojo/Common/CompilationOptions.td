@@ -202,6 +202,22 @@ defm split_cache_dir: CommandOptionHidden<["--", "-"], "split-cache-dir",
     "the program is slower than a default build. Use this option for "
     "development builds. Only `mojo build` reads it.">>;
 
+defm split_cache_base_dir: CommandOptionHidden<["--", "-"],
+  "split-cache-base-dir", CompilationOptionGroup, Index<25>, MetaVarName<"DIR">,
+  HelpText<
+    "Reads the object code of functions from DIR as well, without writing "
+    "to it. Functions that are in neither directory are compiled into the "
+    "directory of `--split-cache-dir`. Use it for a cache that a build "
+    "system provides as a read-only input.">>;
+
+defm split_cache_manifest: CommandOptionHidden<["--", "-"],
+  "split-cache-manifest", CompilationOptionGroup, Index<26>,
+  MetaVarName<"FILE">,
+  HelpText<
+    "Writes to FILE one line for each function object of a build with "
+    "`--split-cache-dir`, in link order: the file name of the object and the "
+    "names of the symbols it defines, separated by tabs.">>;
+
 defm split_cache_max_size: CommandOptionHidden<["--", "-"],
   "split-cache-max-size", CompilationOptionGroup, Index<24>, MetaVarName<"MB">,
   HelpText<

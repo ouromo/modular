@@ -259,6 +259,15 @@ public:
   /// splits whose bitcode changed.
   std::string splitCacheDir;
 
+  /// A second directory of split cache objects that is only read. A split
+  /// that is in neither directory is compiled into `splitCacheDir`.
+  std::string splitCacheBaseDir;
+
+  /// The file that a split cache build writes its manifest to: one line for
+  /// each split in link order, with the file name of the object and the
+  /// names of the values the split defines, separated by tabs.
+  std::string splitCacheManifest;
+
   /// The number of chunks the LLVM module is read in when the split cache is
   /// on. Each chunk is one task.
   unsigned splitCacheChunks = 64;

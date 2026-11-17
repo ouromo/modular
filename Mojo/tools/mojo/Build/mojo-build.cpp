@@ -914,6 +914,20 @@ static int build(const State &subcommandState) {
     options.enableLLVMPerFunctionSplitting = true;
   }
   if (llvm::opt::Arg *arg =
+          args.getLastArg(options::OPT_split_cache_base_dir)) {
+    if (options.splitCacheDir.empty())
+      return state.reportError(
+          "`--split-cache-base-dir` needs `--split-cache-dir`");
+    options.splitCacheBaseDir = arg->getValue();
+  }
+  if (llvm::opt::Arg *arg =
+          args.getLastArg(options::OPT_split_cache_manifest)) {
+    if (options.splitCacheDir.empty())
+      return state.reportError(
+          "`--split-cache-manifest` needs `--split-cache-dir`");
+    options.splitCacheManifest = arg->getValue();
+  }
+  if (llvm::opt::Arg *arg =
           args.getLastArg(options::OPT_split_cache_max_size)) {
     uint64_t megabytes = 0;
     if (StringRef(arg->getValue()).getAsInteger(10, megabytes))

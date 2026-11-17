@@ -216,6 +216,10 @@ private:
   /// of the split, which gives the link order.
   std::vector<std::pair<uint64_t, std::string>> splitCacheObjects;
 
+  /// The manifest line of each split of the current build, with the position
+  /// of the split. Filled when the options ask for a manifest.
+  std::vector<std::pair<uint64_t, std::string>> splitCacheManifestLines;
+
   /// Name of the system linker.
   std::string linker;
 
