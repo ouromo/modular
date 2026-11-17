@@ -50,6 +50,8 @@
 #include "mlir/Target/LLVMIR/ModuleTranslation.h"
 
 #include "llvm/ADT/StringExtras.h"
+#include <map>
+#include <set>
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/LazyCallGraph.h"
 #include "llvm/Analysis/LoopAnalysisManager.h"
@@ -820,6 +822,53 @@ translateModuleToLLVMIR(llvm::LLVMContext &ctx, ModuleOp module,
   return llvmModule;
 }
 
+/// Writes, for each symbol of the module that has a body, the source files and
+/// lines its operations come from, including the call sites and callees of
+/// inlined code. One line per symbol: NAME, then FILE and LINE-RANGES pairs,
+/// all separated by tabs.
+static void writeSplitCacheSourceMap(ModuleOp module, llvm::StringRef path) {
+  std::error_code ec;
+  llvm::raw_fd_ostream os(path, ec);
+  if (ec)
+    return;
+  for (mlir::Operation &top : module.getBody()->getOperations()) {
+    auto nameAttr = top.getAttrOfType<mlir::StringAttr>("sym_name");
+    if (!nameAttr || top.getNumRegions() == 0)
+      continue;
+    std::map<std::string, std::set<unsigned>> lines;
+    mlir::Attribute lastLoc;
+    auto addLoc = [&](mlir::Location loc) {
+      if (mlir::Attribute(loc) == lastLoc)
+        return;
+      lastLoc = loc;
+      mlir::LocationAttr(loc).walk([&](mlir::Location nested) {
+        if (auto file = llvm::dyn_cast<mlir::FileLineColLoc>(nested))
+          lines[file.getFilename().str()].insert(file.getLine());
+        return mlir::WalkResult::advance();
+      });
+    };
+    addLoc(top.getLoc());
+    top.walk([&](mlir::Operation *op) { addLoc(op->getLoc()); });
+    os << nameAttr.getValue();
+    for (auto &[file, set] : lines) {
+      os << '\t' << file << '\t';
+      bool first = true;
+      for (auto it = set.begin(); it != set.end();) {
+        unsigned begin = *it, end = begin;
+        for (++it; it != set.end() && *it == end + 1; ++it)
+          end = *it;
+        if (!first)
+          os << ',';
+        first = false;
+        os << begin;
+        if (end != begin)
+          os << '-' << end;
+      }
+    }
+    os << '\n';
+  }
+}
+
 ErrorOr<std::unique_ptr<llvm::Module>>
 ObjectCompiler::lowerAllFuncsToLLVM(llvm::LLVMContext &ctx, ModuleOp module) {
   CompilerTimeTraceScope traceScope("lower-to-llvm");
@@ -846,6 +895,9 @@ ObjectCompiler::lowerAllFuncsToLLVM(llvm::LLVMContext &ctx, ModuleOp module) {
     return Error(
         "writing module to file before converting to LLVM Dialect failed");
 
+  if (!options.splitCacheManifest.empty())
+    writeSplitCacheSourceMap(module, options.splitCacheManifest + ".src");
+
   if (failed(mgr.run(module)))
     return Error("run LowerToLLVMPipeline failed");
 
@@ -863,6 +915,46 @@ ObjectCompiler::lowerAllFuncsToLLVM(llvm::LLVMContext &ctx, ModuleOp module) {
 }
 
 static void nameConstantsByContent(llvm::Module &module);
+
+/// The interface lines of the manifest, one per split: the object, then for
+/// each function or variable the split defines (D) or only declares (U) a
+/// hash of its type, calling convention and attributes, and its name. A
+/// definition and a use of one name that carry different hashes do not fit
+/// together, whatever the linker says.
+
+static std::string describeSplitInterface(llvm::Module &split) {
+  std::string line;
+  auto add = [&](const llvm::GlobalValue &value, const std::string &text) {
+    if (value.getName().starts_with("llvm."))
+      return;
+    auto hash = llvm::SHA256::hash(llvm::ArrayRef<uint8_t>(
+        reinterpret_cast<const uint8_t *>(text.data()), text.size()));
+    line += value.isDeclaration() ? "\tU:" : "\tD:";
+    line += llvm::toHex(llvm::ArrayRef<uint8_t>(hash.data(), 8));
+    line += ":";
+    line += value.getName();
+  };
+  for (const llvm::Function &function : split) {
+    std::string text;
+    llvm::raw_string_ostream os(text);
+    function.getFunctionType()->print(os);
+    os << " cc" << function.getCallingConv() << " ";
+    // The attributes of the parameters and of the result are part of the
+    // convention (byval, sret, zeroext); those of the function are not.
+    llvm::AttributeList attrs = function.getAttributes();
+    os << attrs.getRetAttrs().getAsString();
+    for (unsigned i = 0, e = function.arg_size(); i != e; ++i)
+      os << "|" << attrs.getParamAttrs(i).getAsString();
+    add(function, text);
+  }
+  for (const llvm::GlobalVariable &variable : split.globals()) {
+    std::string text;
+    llvm::raw_string_ostream os(text);
+    variable.getValueType()->print(os);
+    add(variable, text);
+  }
+  return line;
+}
 
 SmallVector<AsyncRT::AnyAsyncValueRef>
 ObjectCompiler::emitArchiveParallelCompilation(
@@ -1517,6 +1609,9 @@ ObjectCompiler::compileChunkThroughSplitCache(
           std::string name =
               llvm::toHex(llvm::ArrayRef<uint8_t>(hash.data(), 16)) + ".o";
           std::string path = (Twine(options.splitCacheDir) + "/" + name).str();
+          std::string interface;
+          if (!options.splitCacheManifest.empty())
+            interface = describeSplitInterface(*split);
 
           // For the study of the cache keys: the IR of every split as text.
           if (const char *dumpDir = ::getenv("OUROMO_SPLIT_CACHE_DUMP_DIR")) {
@@ -1553,6 +1648,8 @@ ObjectCompiler::compileChunkThroughSplitCache(
               line += "\t" + valueName;
             splitCacheManifestLines.push_back(
                 {(chunkIdx << 32) | splitIdx, std::move(line)});
+            splitCacheInterfaceLines.push_back(
+                {(chunkIdx << 32) | splitIdx, name + interface});
           }
         }
 
@@ -1663,6 +1760,13 @@ ErrorOr<WriteableBufferRef> ObjectCompiler::linkSplitCacheObjects() {
     for (auto &[position, line] : splitCacheManifestLines)
       manifest << line << '\n';
     splitCacheManifestLines.clear();
+    llvm::sort(splitCacheInterfaceLines);
+    llvm::raw_fd_ostream interfaces(options.splitCacheManifest + ".abi", ec);
+    if (ec)
+      return Error("failed to write the manifest of the split cache");
+    for (auto &[position, line] : splitCacheInterfaceLines)
+      interfaces << line << '\n';
+    splitCacheInterfaceLines.clear();
   }
   WriteableBufferRef linked = WriteableBuffer::get();
   *linked << (*fileOr)->getBuffer();
