@@ -10,6 +10,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //===----------------------------------------------------------------------===//
+//
+// Modified by the ouromo project, November 2026: this file differs from the
+// original in https://github.com/modular/modular (tag mojo/v1.2.0). The
+// changes are in the history of https://github.com/ouromo/modular.
+//
 
 #ifndef KGEN_TOOLCOMMON_COMPILATIONOPTIONS_H
 #define KGEN_TOOLCOMMON_COMPILATIONOPTIONS_H

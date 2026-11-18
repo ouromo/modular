@@ -11,6 +11,11 @@
 // limitations under the License.
 //===----------------------------------------------------------------------===//
 //
+// Modified by the ouromo project, November 2026: this file differs from the
+// original in https://github.com/modular/modular (tag mojo/v1.2.0). The
+// changes are in the history of https://github.com/ouromo/modular.
+//
+//
 // This file defines a common set of compilation options for setting up the
 // compilation environment for Mojo programs. The index of the option groups is
 // set to multiples of 5, to allow other option groups to be inserted before or
