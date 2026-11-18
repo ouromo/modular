@@ -11,6 +11,11 @@
 // limitations under the License.
 //===----------------------------------------------------------------------===//
 //
+// Modified by the ouromo project, November 2026: this file differs from the
+// original in https://github.com/modular/modular (tag mojo/v1.2.0). The
+// changes are in the history of https://github.com/ouromo/modular.
+//
+//
 // This file declares utility functions primarily for parsing, printing and
 // verifying KGEN related operations and types.
 //
