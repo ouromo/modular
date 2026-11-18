@@ -17,6 +17,7 @@
 #include "Mojo/ToolCommon/KGENPasses.h"
 #include "Mojo/TransformUtils/CallGraphUtils.h"
 #include "mlir/Analysis/SymbolTableAnalysis.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/SCCIterator.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/LineIterator.h"
@@ -299,26 +300,59 @@ MergedFunctionNames &mergedFunctionNames() {
   return names;
 }
 
+/// "FILE:LINE" of the declaration a function comes from, or "".
+std::string declarationOf(FuncOp func) {
+  std::string result;
+  mlir::LocationAttr(func.getLoc()).walk([&](mlir::Location nested) {
+    auto file = llvm::dyn_cast<mlir::FileLineColLoc>(nested);
+    if (!file)
+      return mlir::WalkResult::advance();
+    result = (file.getFilename().getValue() + ":" + Twine(file.getLine())).str();
+    return mlir::WalkResult::interrupt();
+  });
+  return result;
+}
+
+struct PreviousBuildFiles {
+  std::string mergedPath, changedPath;
+};
+PreviousBuildFiles &previousBuildFiles() {
+  static PreviousBuildFiles files;
+  return files;
+}
+
 /// Which of several identical functions is kept depends on the functions the
-/// program holds. A build of a part of a program (the sub-project of the
-/// incremental rebuild) reads the choices of the full build from the file
-/// named by OUROMO_SPLIT_CACHE_MERGED_NAMES, lines of "FUNCTION\tKEPT", and
-/// adds a copy of a function under the name the full build kept for it when
-/// that function is not in this module. The caller of the compiler vouches that both have
-/// the same code as in the full build.
+/// program holds. A partial build (a small program that reaches the
+/// functions an edit changed) reads the choices of the previous build of the
+/// whole program, lines that begin with "FUNCTION\tKEPT", and adds a copy of a function
+/// under the name the previous build kept for it when that function is not
+/// in this module. A line that names a changed function is skipped: the
+/// previous choice says nothing about new code.
 void addPreviousBuildNames(mlir::ModuleOp module, mlir::SymbolTable &symtab) {
-  const char *path = std::getenv("OUROMO_SPLIT_CACHE_MERGED_NAMES");
-  if (!path)
+  const PreviousBuildFiles &files = previousBuildFiles();
+  if (files.mergedPath.empty())
     return;
-  auto buffer = llvm::MemoryBuffer::getFile(path);
+  auto buffer = llvm::MemoryBuffer::getFile(files.mergedPath);
   if (!buffer)
     return;
+  llvm::StringSet<> changed;
+  std::unique_ptr<llvm::MemoryBuffer> changedBuffer;
+  if (!files.changedPath.empty()) {
+    if (auto file = llvm::MemoryBuffer::getFile(files.changedPath)) {
+      changedBuffer = std::move(*file);
+      for (llvm::line_iterator line(*changedBuffer); !line.is_at_end(); ++line)
+        changed.insert(*line);
+    }
+  }
   llvm::StringMap<FuncOp> byName;
   for (FuncOp func : module.getOps<FuncOp>())
     if (!func.isExternal())
       byName[func.getSymName()] = func;
   for (llvm::line_iterator line(**buffer); !line.is_at_end(); ++line) {
-    auto [from, to] = line->split('\t');
+    auto [from, rest] = line->split('\t');
+    StringRef to = rest.split('\t').first;
+    if (changed.contains(from) || changed.contains(to))
+      continue;
     auto it = byName.find(from);
     if (it == byName.end() || to.empty() || byName.count(to) ||
         mlir::SymbolTable::lookupSymbolIn(module, to))
@@ -337,6 +371,11 @@ void addPreviousBuildNames(mlir::ModuleOp module, mlir::SymbolTable &symtab) {
   }
 }
 } // namespace
+
+void M::KGEN::usePreviousBuildMergedFunctions(std::string mergedPath,
+                                              std::string changedPath) {
+  previousBuildFiles() = {std::move(mergedPath), std::move(changedPath)};
+}
 
 std::vector<std::string> M::KGEN::takeMergedFunctionNames() {
   MergedFunctionNames &names = mergedFunctionNames();
@@ -371,8 +410,11 @@ void EliminateDuplicateFunctionsPass::runOnOperation() {
       auto kept = cg.representativeToLexMin.find(rep->getSymNameAttr());
       if (kept == cg.representativeToLexMin.end() || kept->second == node->func)
         continue;
-      names.lines.insert(
-          (node->func.getSymName() + "\t" + kept->second.getSymName()).str());
+      names.lines.insert((node->func.getSymName() + "\t" +
+                          kept->second.getSymName() + "\t" +
+                          declarationOf(node->func) + "\t" +
+                          declarationOf(kept->second))
+                             .str());
     }
   }
   cg.replaceCallSitesWithLexMin();

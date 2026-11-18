@@ -218,6 +218,24 @@ defm split_cache_manifest: CommandOptionHidden<["--", "-"],
     "`--split-cache-dir`, in link order: the file name of the object and the "
     "names of the symbols it defines, separated by tabs.">>;
 
+defm split_cache_previous_manifest: CommandOptionHidden<["--", "-"],
+  "split-cache-previous-manifest", CompilationOptionGroup, Index<27>,
+  MetaVarName<"FILE">,
+  HelpText<
+    "Makes the build a partial build on top of the build that wrote the "
+    "manifest FILE. The source file is a small program that reaches the "
+    "functions listed with `--split-cache-changed-functions`. The output is "
+    "the previous program with the objects of those functions replaced. The "
+    "build fails if it does not define one of them or if the interface of a "
+    "symbol differs from the previous build; build the whole program then.">>;
+
+defm split_cache_changed_functions: CommandOptionHidden<["--", "-"],
+  "split-cache-changed-functions", CompilationOptionGroup, Index<28>,
+  MetaVarName<"FILE">,
+  HelpText<
+    "Names in FILE, one per line, the functions whose code changed since the "
+    "build of `--split-cache-previous-manifest`.">>;
+
 defm split_cache_max_size: CommandOptionHidden<["--", "-"],
   "split-cache-max-size", CompilationOptionGroup, Index<24>, MetaVarName<"MB">,
   HelpText<

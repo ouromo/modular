@@ -34,6 +34,7 @@
 #include "Mojo/Support/Constants.h"
 #include "Mojo/ToolCommon/CompilationOptions.h"
 #include "Mojo/ToolCommon/InitAllDialects.h"
+#include "Mojo/ToolCommon/KGENPasses.h"
 #include "Support/Compiler/Diags.h"
 #include "Support/Config.h"
 #include "Support/DebugInfoDialect/IR/DebugInfoDialect.h"
@@ -927,6 +928,24 @@ static int build(const State &subcommandState) {
           "`--split-cache-manifest` needs `--split-cache-dir`");
     options.splitCacheManifest = arg->getValue();
   }
+  if (llvm::opt::Arg *arg =
+          args.getLastArg(options::OPT_split_cache_previous_manifest)) {
+    if (options.splitCacheDir.empty())
+      return state.reportError(
+          "`--split-cache-previous-manifest` needs `--split-cache-dir`");
+    options.splitCachePreviousManifest = arg->getValue();
+  }
+  if (llvm::opt::Arg *arg =
+          args.getLastArg(options::OPT_split_cache_changed_functions)) {
+    if (options.splitCachePreviousManifest.empty())
+      return state.reportError("`--split-cache-changed-functions` needs "
+                               "`--split-cache-previous-manifest`");
+    options.splitCacheChangedFunctions = arg->getValue();
+  }
+  if (!options.splitCachePreviousManifest.empty())
+    KGEN::usePreviousBuildMergedFunctions(
+        options.splitCachePreviousManifest + ".dup",
+        options.splitCacheChangedFunctions);
   if (llvm::opt::Arg *arg =
           args.getLastArg(options::OPT_split_cache_max_size)) {
     uint64_t megabytes = 0;

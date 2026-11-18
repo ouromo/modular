@@ -50,6 +50,9 @@
 #include "mlir/Target/LLVMIR/Export.h"
 #include "mlir/Target/LLVMIR/ModuleTranslation.h"
 
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/StringSet.h"
+#include "llvm/Support/LineIterator.h"
 #include "llvm/ADT/StringExtras.h"
 #include <map>
 #include <set>
@@ -1610,18 +1613,11 @@ ObjectCompiler::compileChunkThroughSplitCache(
           std::string name =
               llvm::toHex(llvm::ArrayRef<uint8_t>(hash.data(), 16)) + ".o";
           std::string path = (Twine(options.splitCacheDir) + "/" + name).str();
+          bool describe = !options.splitCacheManifest.empty() ||
+                          !options.splitCachePreviousManifest.empty();
           std::string interface;
-          if (!options.splitCacheManifest.empty())
+          if (describe)
             interface = describeSplitInterface(*split);
-
-          // For the study of the cache keys: the IR of every split as text.
-          if (const char *dumpDir = ::getenv("OUROMO_SPLIT_CACHE_DUMP_DIR")) {
-            std::error_code dumpEc;
-            llvm::raw_fd_ostream dump(
-                (Twine(dumpDir) + "/" + name + ".ll").str(), dumpEc);
-            if (!dumpEc)
-              split->print(dump, nullptr);
-          }
 
           // An object of the base directory is used where it is; the base
           // directory is never written.
@@ -1643,7 +1639,7 @@ ObjectCompiler::compileChunkThroughSplitCache(
 
           std::lock_guard<std::mutex> lock(splitCacheMutex);
           splitCacheObjects.push_back({(chunkIdx << 32) | splitIdx, path});
-          if (!options.splitCacheManifest.empty()) {
+          if (describe) {
             std::string line = name;
             for (const std::string &valueName : names)
               line += "\t" + valueName;
@@ -1707,12 +1703,315 @@ ObjectCompiler::compileChunkThroughSplitCache(
   return result;
 }
 
+/// Constants are named by their content; any object that holds one will do.
+static bool isSplitCacheData(StringRef name) {
+  return name.starts_with("static_string_") ||
+         name.starts_with("global_constant_");
+}
+
+static bool readLines(const std::string &path,
+                      std::vector<std::string> &lines) {
+  auto buffer = llvm::MemoryBuffer::getFile(path);
+  if (!buffer)
+    return false;
+  for (llvm::line_iterator line(**buffer); !line.is_at_end(); ++line)
+    lines.push_back(line->str());
+  return true;
+}
+
+using SplitCacheLines = std::vector<std::pair<uint64_t, std::string>>;
+
+/// The link step of a partial build. On entry the three lists describe the
+/// splits of this build (path of the object, manifest line, interface line).
+/// On return they describe the previous build's program with the objects of
+/// the changed functions replaced by this build's, without the objects that
+/// nothing refers to any more, followed by the objects of this build that
+/// define a symbol the replacements use and the previous program lacks. Nothing else of this build is used; its `main` and startup
+/// code in particular are those of the small program.
+///
+/// Returns a message when the result would not be the program a build of
+/// the whole source gives: a changed function that this build does not
+/// define and the program still refers to, or a symbol whose type or calling
+/// convention differs between the two builds.
+static std::string mergeIntoPreviousBuild(const CompilationOptions &options,
+                                          SplitCacheLines &objects,
+                                          SplitCacheLines &manifestLines,
+                                          SplitCacheLines &interfaceLines) {
+  const std::string &previous = options.splitCachePreviousManifest;
+  std::vector<std::string> baseLines, baseInterfaces, changed;
+  if (!readLines(previous, baseLines) ||
+      !readLines(previous + ".abi", baseInterfaces))
+    return "failed to read the manifest of the previous build '" + previous +
+           "'";
+  if (!options.splitCacheChangedFunctions.empty() &&
+      !readLines(options.splitCacheChangedFunctions, changed))
+    return "failed to read '" + options.splitCacheChangedFunctions + "'";
+
+  // The fields of a line after the first, which is the object.
+  auto fields = [](StringRef line) {
+    SmallVector<StringRef, 8> parts;
+    line.split(parts, '\t');
+    parts.erase(parts.begin());
+    return parts;
+  };
+  // Calls `visit(kind, hash, name)` for each symbol of an interface line.
+  auto forEachSymbol = [&](StringRef line, auto visit) {
+    for (StringRef item : fields(line)) {
+      auto [kind, rest] = item.split(':');
+      auto [hash, name] = rest.split(':');
+      visit(kind, hash, name);
+    }
+  };
+
+  // This build.
+  llvm::sort(objects);
+  llvm::sort(manifestLines);
+  llvm::sort(interfaceLines);
+  size_t numSplits = objects.size();
+  if (manifestLines.size() != numSplits || interfaceLines.size() != numSplits)
+    return "internal error: incomplete description of the partial build";
+  llvm::StringMap<size_t> subFunction, subSymbol;
+  for (size_t i = 0; i != numSplits; ++i) {
+    for (StringRef name : fields(manifestLines[i].second)) {
+      subSymbol.try_emplace(name, i);
+      if (!isSplitCacheData(name))
+        subFunction.try_emplace(name, i);
+    }
+  }
+  auto objectOf = [&](size_t i) {
+    return StringRef(manifestLines[i].second).split('\t').first;
+  };
+
+  // The previous build.
+  llvm::StringMap<size_t> baseFunction;
+  for (auto [i, line] : llvm::enumerate(baseLines))
+    for (StringRef name : fields(line))
+      if (!isSplitCacheData(name))
+        baseFunction[name] = i;
+  llvm::StringMap<size_t> baseSymbol;
+  for (auto [i, line] : llvm::enumerate(baseLines))
+    for (StringRef name : fields(line))
+      baseSymbol[name] = i;
+  llvm::StringMap<StringRef> baseInterfaceOf;
+  for (const std::string &line : baseInterfaces)
+    baseInterfaceOf[StringRef(line).split('\t').first] = line;
+  auto baseInterface = [&](size_t i) {
+    return baseInterfaceOf.lookup(StringRef(baseLines[i]).split('\t').first);
+  };
+
+  // The changed functions the previous program contains come from this
+  // build. One that this build lacks is gone from the program (removed, or
+  // its name changed with its signature) if nothing refers to it any more.
+  std::vector<int64_t> replacement(baseLines.size(), -1);
+  std::vector<bool> dropped(baseLines.size(), false), absent(baseLines.size());
+  std::vector<std::pair<std::string, size_t>> absentFunctions;
+  for (const std::string &name : changed) {
+    auto base = baseFunction.find(name);
+    if (base == baseFunction.end())
+      continue;
+    auto sub = subFunction.find(name);
+    if (sub == subFunction.end()) {
+      absentFunctions.push_back({name, base->second});
+      absent[base->second] = true;
+      continue;
+    }
+    StringRef baseObject = StringRef(baseLines[base->second]).split('\t').first;
+    if (objectOf(sub->second) != baseObject)
+      replacement[base->second] = sub->second;
+  }
+  for (auto &[name, i] : absentFunctions)
+    if (replacement[i] >= 0)
+      absent[i] = false;
+
+  // What the replaced program defines, then the objects of this build that
+  // the replacements need on top of it.
+  llvm::StringSet<> defined;
+  std::vector<size_t> todo, added;
+  llvm::DenseSet<size_t> taken;
+  auto take = [&](size_t i) {
+    for (StringRef name : fields(manifestLines[i].second))
+      defined.insert(name);
+    if (taken.insert(i).second)
+      todo.push_back(i);
+  };
+  for (auto [i, line] : llvm::enumerate(baseLines))
+    if (replacement[i] < 0 && !absent[i])
+      for (StringRef name : fields(line))
+        defined.insert(name);
+  for (int64_t i : replacement)
+    if (i >= 0)
+      take(i);
+  while (!todo.empty()) {
+    size_t i = todo.back();
+    todo.pop_back();
+    forEachSymbol(interfaceLines[i].second,
+                  [&](StringRef kind, StringRef, StringRef name) {
+                    if (kind != "U" || defined.contains(name))
+                      return;
+                    auto it = subSymbol.find(name);
+                    if (it == subSymbol.end())
+                      return;
+                    if (!taken.contains(it->second))
+                      added.push_back(it->second);
+                    take(it->second);
+                  });
+  }
+
+  // How many times the objects of the merged program refer to each symbol.
+  llvm::StringMap<int> uses;
+  auto countUses = [&](StringRef interfaceLine, int delta) {
+    forEachSymbol(interfaceLine, [&](StringRef kind, StringRef, StringRef name) {
+      if (kind == "U")
+        uses[name] += delta;
+    });
+  };
+  for (size_t i = 0, e = baseLines.size(); i != e; ++i)
+    if (replacement[i] < 0 && !absent[i])
+      countUses(baseInterface(i), 1);
+  for (size_t i : taken)
+    countUses(interfaceLines[i].second, 1);
+  // True when no other object of the merged program refers to a symbol the
+  // previous build's object `i` defines. `counted` says whether the object's
+  // own references are in `uses`.
+  auto unused = [&](size_t i, bool counted) {
+    llvm::StringMap<int> own;
+    if (counted)
+      forEachSymbol(baseInterface(i),
+                    [&](StringRef kind, StringRef, StringRef name) {
+                      if (kind == "U")
+                        ++own[name];
+                    });
+    for (StringRef name : fields(baseLines[i]))
+      if (uses.lookup(name) > own.lookup(name))
+        return false;
+    return true;
+  };
+  std::string missing;
+  for (auto &[name, i] : absentFunctions)
+    if (uses.lookup(name) > 0)
+      missing += "\n  missing: " + name;
+  if (!missing.empty())
+    return "the partial build does not define these changed functions:" +
+           missing;
+  for (size_t i = 0, e = baseLines.size(); i != e; ++i) {
+    if (!absent[i])
+      continue;
+    if (unused(i, /*counted=*/false))
+      dropped[i] = true;
+    else
+      countUses(baseInterface(i), 1);
+  }
+
+  // A full build holds only what the program reaches. Drop the objects that
+  // were reached through the old code of the replaced and dropped objects
+  // and that nothing refers to now.
+  std::vector<size_t> candidates;
+  auto addCallees = [&](size_t i) {
+    forEachSymbol(baseInterface(i),
+                  [&](StringRef kind, StringRef, StringRef name) {
+                    auto it = baseSymbol.find(name);
+                    if (kind == "U" && it != baseSymbol.end())
+                      candidates.push_back(it->second);
+                  });
+  };
+  for (size_t i = 0, e = baseLines.size(); i != e; ++i)
+    if (replacement[i] >= 0 || dropped[i])
+      addCallees(i);
+  while (!candidates.empty()) {
+    size_t i = candidates.back();
+    candidates.pop_back();
+    if (replacement[i] >= 0 || dropped[i] || !unused(i, /*counted=*/true))
+      continue;
+    dropped[i] = true;
+    countUses(baseInterface(i), -1);
+    addCallees(i);
+  }
+
+  // A name does not fix the calling convention: every symbol of an object
+  // taken from this build must have the interface that the objects kept
+  // from the previous build saw. The hash is empty when those hold two.
+  llvm::StringMap<std::string> baseHash;
+  for (size_t i = 0, e = baseLines.size(); i != e; ++i) {
+    if (replacement[i] >= 0 || dropped[i])
+      continue;
+    forEachSymbol(baseInterface(i),
+                  [&](StringRef, StringRef hash, StringRef name) {
+                    auto [it, isNew] = baseHash.try_emplace(name, hash.str());
+                    if (!isNew && it->second != hash)
+                      it->second.clear();
+                  });
+  }
+  for (size_t i : taken) {
+    std::string mismatch;
+    forEachSymbol(interfaceLines[i].second,
+                  [&](StringRef, StringRef hash, StringRef name) {
+                    auto it = baseHash.find(name);
+                    if (it != baseHash.end() && it->second != hash &&
+                        mismatch.empty())
+                      mismatch = name.str();
+                  });
+    if (!mismatch.empty())
+      return "the interface of '" + mismatch +
+             "' differs from the previous build";
+  }
+
+  // The merged program.
+  SplitCacheLines mergedObjects, mergedManifest, mergedInterfaces;
+  auto addSplit = [&](size_t i) {
+    uint64_t position = mergedObjects.size();
+    mergedObjects.push_back({position, objects[i].second});
+    mergedManifest.push_back({position, manifestLines[i].second});
+    mergedInterfaces.push_back({position, interfaceLines[i].second});
+  };
+  for (auto [i, line] : llvm::enumerate(baseLines)) {
+    if (dropped[i])
+      continue;
+    if (replacement[i] >= 0) {
+      addSplit(replacement[i]);
+      continue;
+    }
+    StringRef object = StringRef(line).split('\t').first;
+    std::string path = (Twine(options.splitCacheDir) + "/" + object).str();
+    if (llvm::sys::fs::exists(path)) {
+      std::error_code ec;
+      std::filesystem::last_write_time(
+          path, std::filesystem::file_time_type::clock::now(), ec);
+    } else {
+      path = (Twine(options.splitCacheBaseDir) + "/" + object).str();
+      if (options.splitCacheBaseDir.empty() || !llvm::sys::fs::exists(path))
+        return ("the object '" + object +
+                "' of the previous build is not in the split cache")
+            .str();
+    }
+    uint64_t position = mergedObjects.size();
+    mergedObjects.push_back({position, std::move(path)});
+    mergedManifest.push_back({position, line});
+    mergedInterfaces.push_back({position, baseInterface(i).str()});
+  }
+  for (size_t i : added)
+    addSplit(i);
+  objects = std::move(mergedObjects);
+  manifestLines = std::move(mergedManifest);
+  interfaceLines = std::move(mergedInterfaces);
+  return "";
+}
+
 ErrorOr<WriteableBufferRef> ObjectCompiler::linkSplitCacheObjects() {
   CompilerTimeTraceScope traceScope("linkSplitCacheObjects");
   std::lock_guard<std::mutex> lock(splitCacheMutex);
 
   // The tasks finish in any order; the position gives a stable link order.
   llvm::sort(splitCacheObjects);
+
+  bool partial = !options.splitCachePreviousManifest.empty();
+  if (partial) {
+    std::string problem =
+        mergeIntoPreviousBuild(options, splitCacheObjects,
+                               splitCacheManifestLines,
+                               splitCacheInterfaceLines);
+    if (!problem.empty())
+      return Error("partial build: " + problem);
+  }
 
   llvm::SmallString<128> rspPath, outPath;
   if (llvm::sys::fs::createUniqueFile(

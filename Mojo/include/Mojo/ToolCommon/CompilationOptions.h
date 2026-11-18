@@ -268,6 +268,17 @@ public:
   /// names of the values the split defines, separated by tabs.
   std::string splitCacheManifest;
 
+  /// The manifest of a previous build of the whole program. With it the
+  /// build is a partial build: the source is a small program that reaches
+  /// the functions an edit changed, and the result is the previous build's
+  /// object list with the objects of those functions replaced.
+  std::string splitCachePreviousManifest;
+
+  /// A file with the names of the functions whose code changed since the
+  /// previous build, one per line. A partial build must define each of them
+  /// that the previous build contains.
+  std::string splitCacheChangedFunctions;
+
   /// The number of chunks the LLVM module is read in when the split cache is
   /// on. Each chunk is one task.
   unsigned splitCacheChunks = 64;

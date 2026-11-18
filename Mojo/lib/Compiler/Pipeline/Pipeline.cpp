@@ -17,11 +17,153 @@
 #include "Support/DebugInfoDialect/DebugInfoToLLVM/DebugInfoToLLVM.h"
 #include "Support/DebugInfoDialect/Transforms/Passes.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include <set>
+#include <functional>
+#include "llvm/Support/raw_ostream.h"
+#include "mlir/Pass/Pass.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
 
 using namespace M;
+
+namespace {
+/// Writes, for the manifest of the split cache, the declarations that each
+/// declaration of the program names in its types and attributes, while the
+/// program still has the types of the source. Later stages replace a struct
+/// by its layout, and nothing then tells which functions a changed field
+/// reaches.
+///
+/// One line per declaration that names another one: the operation, the
+/// qualified name, "FILE:LINE", then the names, separated by tabs. Names of
+/// the standard library are left out.
+struct RecordDeclarationUses
+    : public mlir::PassWrapper<RecordDeclarationUses,
+                               mlir::OperationPass<mlir::ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RecordDeclarationUses)
+
+  explicit RecordDeclarationUses(std::string path) : path(std::move(path)) {}
+  llvm::StringRef getName() const override { return "RecordDeclarationUses"; }
+  std::unique_ptr<mlir::Pass> clonePass() const override {
+    return std::make_unique<RecordDeclarationUses>(path);
+  }
+
+  /// The symbol paths in the printed form of a type or attribute:
+  /// `@a::@b::@"c d"` gives "a::b::c d".
+  static void scan(llvm::StringRef text, std::vector<std::string> &names) {
+    for (size_t i = 0, e = text.size(); i < e; ++i) {
+      if (text[i] != '@')
+        continue;
+      std::string name;
+      while (i < e && text[i] == '@') {
+        size_t begin = ++i;
+        if (i < e && text[i] == '"') {
+          begin = ++i;
+          while (i < e && text[i] != '"')
+            i += text[i] == '\\' ? 2 : 1;
+          name += text.substr(begin, std::min(i, e) - begin);
+          ++i;
+        } else {
+          while (i < e && (isalnum(text[i]) || text[i] == '_' ||
+                           text[i] == '$' || text[i] == '.'))
+            ++i;
+          name += text.substr(begin, i - begin);
+        }
+        if (i + 2 < e && text[i] == ':' && text[i + 1] == ':' &&
+            text[i + 2] == '@') {
+          name += "::";
+          i += 2;
+        } else {
+          break;
+        }
+      }
+      if (!name.empty() && !llvm::StringRef(name).starts_with("std::"))
+        names.push_back(std::move(name));
+    }
+  }
+
+  void runOnOperation() override {
+    std::error_code ec;
+    llvm::raw_fd_ostream os(path, ec);
+    if (ec)
+      return;
+    // The names in each distinct type and attribute, found once.
+    llvm::DenseMap<const void *, std::vector<std::string>> cache;
+    auto namesIn = [&](const void *key, auto print)
+        -> const std::vector<std::string> & {
+      auto [it, isNew] = cache.try_emplace(key);
+      if (isNew) {
+        std::string text;
+        llvm::raw_string_ostream stream(text);
+        print(stream);
+        scan(text, it->second);
+      }
+      return it->second;
+    };
+    std::function<void(mlir::Operation &, std::string, std::set<std::string> *)>
+        visit = [&](mlir::Operation &op, std::string scope,
+                    std::set<std::string> *uses) {
+          std::set<std::string> own;
+          auto nameAttr = op.getAttrOfType<mlir::StringAttr>("sym_name");
+          bool declaration = nameAttr && op.getNumRegions() != 0;
+          if (declaration) {
+            scope += (scope.empty() ? "" : "::") + nameAttr.getValue().str();
+            uses = &own;
+          }
+          if (uses) {
+            auto add = [&](const std::vector<std::string> &names) {
+              uses->insert(names.begin(), names.end());
+            };
+            for (mlir::Type type : op.getResultTypes())
+              add(namesIn(type.getAsOpaquePointer(),
+                          [&](llvm::raw_ostream &o) { type.print(o); }));
+            for (mlir::NamedAttribute attr : op.getAttrs())
+              if (attr.getName() != "sym_name" &&
+                  !llvm::isa<mlir::StringAttr>(attr.getValue()))
+                add(namesIn(attr.getValue().getAsOpaquePointer(),
+                            [&](llvm::raw_ostream &o) {
+                              attr.getValue().print(o);
+                            }));
+            for (mlir::Region &region : op.getRegions())
+              for (mlir::Block &block : region)
+                for (mlir::BlockArgument arg : block.getArguments())
+                  add(namesIn(arg.getType().getAsOpaquePointer(),
+                              [&](llvm::raw_ostream &o) {
+                                arg.getType().print(o);
+                              }));
+          }
+          for (mlir::Region &region : op.getRegions())
+            for (mlir::Block &block : region)
+              for (mlir::Operation &nested : block)
+                visit(nested, scope, uses);
+          // A function that names nothing is of no use to the reader; a
+          // type is listed in any case, so that it can be found.
+          if (!declaration ||
+              (own.empty() && op.getName().getStringRef() == "lit.fn"))
+            return;
+          std::string where;
+          mlir::LocationAttr(op.getLoc()).walk([&](mlir::Location nested) {
+            auto file = llvm::dyn_cast<mlir::FileLineColLoc>(nested);
+            if (!file)
+              return mlir::WalkResult::advance();
+            where = (file.getFilename().getValue() + ":" +
+                     llvm::Twine(file.getLine()))
+                        .str();
+            return mlir::WalkResult::interrupt();
+          });
+          os << op.getName().getStringRef() << '\t' << scope << '\t' << where;
+          for (const std::string &name : own)
+            os << '\t' << name;
+          os << '\n';
+        };
+    for (mlir::Operation &op : *getOperation().getBody())
+      visit(op, "", nullptr);
+  }
+
+  std::string path;
+};
+} // namespace
 using namespace KGEN;
 
 void KGEN::buildCheckLITPipeline(mlir::PassManager &pm,
@@ -44,6 +186,10 @@ void KGEN::buildCheckLITPipeline(mlir::PassManager &pm,
 static void buildLowerLITPipeline(mlir::PassManager &pm,
                                   const CompilationOptions &options) {
   buildCheckLITPipeline(pm, options);
+
+  if (!options.splitCacheManifest.empty())
+    pm.addPass(std::make_unique<RecordDeclarationUses>(
+        options.splitCacheManifest + ".use"));
 
   pm.addPass(createLowerLIT(
       {static_cast<llvm::dwarf::SourceLanguage>(options.debugInfoLanguage)}));

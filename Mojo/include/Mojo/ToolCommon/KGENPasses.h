@@ -364,8 +364,17 @@ ErrorOrSuccess parseEmissionOptions(EmissionOptions emissionOptions);
 ErrorOrSuccess resetEmissionOptions(EmissionOptions emissionOptions);
 
 /// The functions the duplicate function elimination replaced since the last
-/// call, as "FUNCTION\tKEPT", sorted.
+/// call, sorted. One line each: the function, the function kept in its
+/// place, and the "FILE:LINE" of the declaration of each, separated by tabs.
 std::vector<std::string> takeMergedFunctionNames();
+
+/// For a partial build: `mergedPath` holds the lines takeMergedFunctionNames
+/// gave for the previous build of the whole program, `changedPath` (may be
+/// empty) the names of the functions whose code changed since. The duplicate
+/// function elimination then keeps, for the functions that did not change,
+/// the same function of each group as the previous build did.
+void usePreviousBuildMergedFunctions(std::string mergedPath,
+                                     std::string changedPath);
 
 } // namespace KGEN
 } // namespace M
