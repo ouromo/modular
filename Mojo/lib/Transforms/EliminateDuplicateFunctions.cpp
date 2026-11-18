@@ -18,6 +18,12 @@
 #include "Mojo/TransformUtils/CallGraphUtils.h"
 #include "mlir/Analysis/SymbolTableAnalysis.h"
 #include "llvm/ADT/SCCIterator.h"
+#include "llvm/ADT/StringMap.h"
+#include "llvm/Support/LineIterator.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include <cstdlib>
+#include <mutex>
+#include <set>
 
 using namespace M;
 using namespace KGEN;
@@ -283,18 +289,92 @@ void CallGraph::replaceCallSitesWithLexMin() {
   state.join();
 }
 
+namespace {
+struct MergedFunctionNames {
+  std::mutex mutex;
+  std::set<std::string> lines;
+};
+MergedFunctionNames &mergedFunctionNames() {
+  static MergedFunctionNames names;
+  return names;
+}
+
+/// Which of several identical functions is kept depends on the functions the
+/// program holds. A build of a part of a program (the sub-project of the
+/// incremental rebuild) reads the choices of the full build from the file
+/// named by OUROMO_SPLIT_CACHE_MERGED_NAMES, lines of "FUNCTION\tKEPT", and
+/// adds a copy of a function under the name the full build kept for it when
+/// that function is not in this module. The caller of the compiler vouches that both have
+/// the same code as in the full build.
+void addPreviousBuildNames(mlir::ModuleOp module, mlir::SymbolTable &symtab) {
+  const char *path = std::getenv("OUROMO_SPLIT_CACHE_MERGED_NAMES");
+  if (!path)
+    return;
+  auto buffer = llvm::MemoryBuffer::getFile(path);
+  if (!buffer)
+    return;
+  llvm::StringMap<FuncOp> byName;
+  for (FuncOp func : module.getOps<FuncOp>())
+    if (!func.isExternal())
+      byName[func.getSymName()] = func;
+  for (llvm::line_iterator line(**buffer); !line.is_at_end(); ++line) {
+    auto [from, to] = line->split('\t');
+    auto it = byName.find(from);
+    if (it == byName.end() || to.empty() || byName.count(to) ||
+        mlir::SymbolTable::lookupSymbolIn(module, to))
+      continue;
+    // Add a copy under the kept name. It is identical to the function and
+    // its name sorts first, so the pass redirects the calls to it.
+    FuncOp func = it->second;
+    FuncOp copy = cast<FuncOp>(func->clone());
+    mlir::SymbolTable::setSymbolName(copy,
+                                     StringAttr::get(module.getContext(), to));
+    module.getBody()->getOperations().insertAfter(
+        mlir::Block::iterator(func.getOperation()), copy.getOperation());
+    // Later passes look the copy up in the symbol table of the analysis.
+    symtab.insert(copy.getOperation());
+    byName[to] = copy;
+  }
+}
+} // namespace
+
+std::vector<std::string> M::KGEN::takeMergedFunctionNames() {
+  MergedFunctionNames &names = mergedFunctionNames();
+  std::lock_guard<std::mutex> lock(names.mutex);
+  std::vector<std::string> result(names.lines.begin(), names.lines.end());
+  names.lines.clear();
+  return result;
+}
+
 void EliminateDuplicateFunctionsPass::runOnOperation() {
   VerboseCompilerTimeTraceScope traceScope("eliminateDuplicateFunctions");
 
   mlir::ModuleOp module = getOperation();
   const SymbolTable &symtab =
       getAnalysis<mlir::SymbolTableAnalysis>().getTopLevelSymbolTable();
+  addPreviousBuildNames(module, const_cast<mlir::SymbolTable &>(symtab));
   auto &cpuDevice = *loadContext(&getContext())->get<AsyncRT::CPUDevice>();
 
   CallGraph cg(module, symtab, cpuDevice);
   cg.startDeduplication();
   cg.replaceCallSitesWithLexMin();
   this->numDeduped = cg.numDeduped;
+  // Record each function that calls were redirected away from, with the
+  // function kept in its place, for the manifest of the split cache.
+  {
+    MergedFunctionNames &names = mergedFunctionNames();
+    std::lock_guard<std::mutex> lock(names.mutex);
+    for (CallGraphNode *node : cg.workItems) {
+      auto rep = cg.uniqueFuncSet.find(node->func);
+      if (rep == cg.uniqueFuncSet.end())
+        continue;
+      auto kept = cg.representativeToLexMin.find(rep->getSymNameAttr());
+      if (kept == cg.representativeToLexMin.end() || kept->second == node->func)
+        continue;
+      names.lines.insert(
+          (node->func.getSymName() + "\t" + kept->second.getSymName()).str());
+    }
+  }
   // NOTE: We do not erase the duplicated function in the pass but rely later
   // passes to cleanup. A duplicate function is not always a dead symbol as it
   // might be referenced by operations other than KGENCallOpInterface.

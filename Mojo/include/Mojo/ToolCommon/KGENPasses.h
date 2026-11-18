@@ -363,6 +363,10 @@ void registerLowerToLLVMPipeline();
 ErrorOrSuccess parseEmissionOptions(EmissionOptions emissionOptions);
 ErrorOrSuccess resetEmissionOptions(EmissionOptions emissionOptions);
 
+/// The functions the duplicate function elimination replaced since the last
+/// call, as "FUNCTION\tKEPT", sorted.
+std::vector<std::string> takeMergedFunctionNames();
+
 } // namespace KGEN
 } // namespace M
 

@@ -1774,6 +1774,12 @@ ErrorOr<WriteableBufferRef> ObjectCompiler::linkSplitCacheObjects() {
       return Error("failed to write the manifest of the split cache");
     for (const std::string &line : KGEN::takeCapturedSourceLocs())
       captured << line << '\n';
+    // The identical functions that were merged, and the one kept for each.
+    llvm::raw_fd_ostream merged(options.splitCacheManifest + ".dup", ec);
+    if (ec)
+      return Error("failed to write the manifest of the split cache");
+    for (const std::string &line : KGEN::takeMergedFunctionNames())
+      merged << line << '\n';
   }
   WriteableBufferRef linked = WriteableBuffer::get();
   *linked << (*fileOr)->getBuffer();
