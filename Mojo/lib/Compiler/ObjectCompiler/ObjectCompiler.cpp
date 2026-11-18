@@ -1886,13 +1886,6 @@ static std::string mergeIntoPreviousBuild(const CompilationOptions &options,
         return false;
     return true;
   };
-  std::string missing;
-  for (auto &[name, i] : absentFunctions)
-    if (uses.lookup(name) > 0)
-      missing += "\n  missing: " + name;
-  if (!missing.empty())
-    return "the partial build does not define these changed functions:" +
-           missing;
   for (size_t i = 0, e = baseLines.size(); i != e; ++i) {
     if (!absent[i])
       continue;
@@ -1926,6 +1919,17 @@ static std::string mergeIntoPreviousBuild(const CompilationOptions &options,
     countUses(baseInterface(i), -1);
     addCallees(i);
   }
+
+  // A changed function that this build lacks has to be out of use now. This
+  // comes after the objects above are dropped: one of them may be its last
+  // user.
+  std::string missing;
+  for (auto &[name, i] : absentFunctions)
+    if (uses.lookup(name) > 0)
+      missing += "\n  missing: " + name;
+  if (!missing.empty())
+    return "the partial build does not define these changed functions:" +
+           missing;
 
   // A name does not fix the calling convention: every symbol of an object
   // taken from this build must have the interface that the objects kept
