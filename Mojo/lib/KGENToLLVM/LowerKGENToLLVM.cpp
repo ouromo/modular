@@ -1042,6 +1042,8 @@ struct ConvertKGENSourceLoc : ConvertPOPToLLVMPattern<SourceLocOp> {
                               return WalkResult::interrupt();
                             });
 
+    if (bestFrame)
+      recordCapturedSourceLoc(bestFrame, 'F');
     Location loc = op.getLoc();
     FileLineColLoc frame =
         bestFrame ? DebugInfo::extractSourceLoc(bestFrame) : FileLineColLoc();

@@ -666,6 +666,17 @@ inline ConstraintAttr getUnconditionalConstraint(MLIRContext *ctx) {
                              UnknownLoc::get(ctx), /*message=*/StringAttr());
 }
 
+/// Note that the code being compiled read the source location `loc` as a
+/// value (`kgen.source_loc`): `kind` is 'F' when a fold or the lowering
+/// resolved it and 'C' when the compile time interpreter did. The split
+/// cache manifest lists these, so a tool can tell which functions change
+/// when their lines move.
+void recordCapturedSourceLoc(mlir::Location loc, char kind);
+
+/// The locations recorded so far as "KIND\tFILE\tLINE", sorted, and forget
+/// them.
+std::vector<std::string> takeCapturedSourceLocs();
+
 } // namespace M::KGEN
 
 #include "Support/ADT/DenseStringMap.h" // IWYU pragma: keep

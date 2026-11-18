@@ -14,6 +14,9 @@
 #include "Mojo/Interpreter/InterpreterState.h"
 #include "Mojo/Interpreter/ParametricInterpreterState.h"
 #include "Mojo/KGENDialect/KGENOps.h"
+#include "Mojo/KGENDialect/KGENUtils.h"
+#include <mutex>
+#include <set>
 #include "Mojo/Support/CompilerProfiling.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Support/DebugStringHelper.h"
@@ -616,6 +619,38 @@ ErrorTreeOrSuccess IsRunInComptimeInterpreterOp::parametric_interpret(
 // SourceLocOp
 //===----------------------------------------------------------------------===//
 
+namespace {
+struct CapturedSourceLocs {
+  std::mutex mutex;
+  std::set<std::string> lines;
+};
+CapturedSourceLocs &capturedSourceLocs() {
+  static CapturedSourceLocs locs;
+  return locs;
+}
+} // namespace
+
+void M::KGEN::recordCapturedSourceLoc(Location loc, char kind) {
+  FileLineColLoc file = DebugInfo::extractSourceLoc(loc);
+  if (!file)
+    return;
+  std::string line = (Twine(StringRef(&kind, 1)) + "\t" +
+                      file.getFilename().getValue() + "\t" +
+                      Twine(file.getLine()))
+                         .str();
+  CapturedSourceLocs &locs = capturedSourceLocs();
+  std::lock_guard<std::mutex> lock(locs.mutex);
+  locs.lines.insert(std::move(line));
+}
+
+std::vector<std::string> M::KGEN::takeCapturedSourceLocs() {
+  CapturedSourceLocs &locs = capturedSourceLocs();
+  std::lock_guard<std::mutex> lock(locs.mutex);
+  std::vector<std::string> result(locs.lines.begin(), locs.lines.end());
+  locs.lines.clear();
+  return result;
+}
+
 /// Resolve negative inlineCounts by inspecting location.
 /// Non-negative inlineCounts can be optionally handled by providing `state`.
 /// On success, pushes the three result attributes into the result vector.
@@ -666,6 +701,7 @@ static LogicalResult sourceLocOpHelper(int64_t inlineCount, MLIRContext *ctx,
     return success();
   }
 
+  recordCapturedSourceLoc(targetLocation, state ? 'C' : 'F');
   FileLineColLoc fileLoc = DebugInfo::extractSourceLoc(targetLocation);
   results.insert(results.begin(),
                  {b.getIndexAttr(fileLoc.getLine()),

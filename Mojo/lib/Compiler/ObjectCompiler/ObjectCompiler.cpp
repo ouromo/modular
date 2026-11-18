@@ -30,6 +30,7 @@
 #include "Mojo/Compiler/LLVMOptimizationPipeline.h"
 #include "Mojo/Compiler/Target/TargetBackend.h"
 #include "Mojo/KGENDialect/KGENAttrs.h"
+#include "Mojo/KGENDialect/KGENUtils.h"
 #include "Mojo/Support/BuildInfo.h"
 #include "Mojo/Support/CompilerProfiling.h"
 #include "Mojo/Support/Configuration.h"
@@ -1767,6 +1768,12 @@ ErrorOr<WriteableBufferRef> ObjectCompiler::linkSplitCacheObjects() {
     for (auto &[position, line] : splitCacheInterfaceLines)
       interfaces << line << '\n';
     splitCacheInterfaceLines.clear();
+    // The source locations the program read as values.
+    llvm::raw_fd_ostream captured(options.splitCacheManifest + ".loc", ec);
+    if (ec)
+      return Error("failed to write the manifest of the split cache");
+    for (const std::string &line : KGEN::takeCapturedSourceLocs())
+      captured << line << '\n';
   }
   WriteableBufferRef linked = WriteableBuffer::get();
   *linked << (*fileOr)->getBuffer();
