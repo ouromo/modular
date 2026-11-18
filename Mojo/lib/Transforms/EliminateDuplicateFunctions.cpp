@@ -357,10 +357,10 @@ void EliminateDuplicateFunctionsPass::runOnOperation() {
 
   CallGraph cg(module, symtab, cpuDevice);
   cg.startDeduplication();
-  cg.replaceCallSitesWithLexMin();
-  this->numDeduped = cg.numDeduped;
-  // Record each function that calls were redirected away from, with the
-  // function kept in its place, for the manifest of the split cache.
+  // Record each function that calls are redirected away from, with the
+  // function kept in its place, for the manifest of the split cache. This
+  // comes before the redirection, which changes function bodies and with
+  // them the hashes the set is keyed by.
   {
     MergedFunctionNames &names = mergedFunctionNames();
     std::lock_guard<std::mutex> lock(names.mutex);
@@ -375,6 +375,8 @@ void EliminateDuplicateFunctionsPass::runOnOperation() {
           (node->func.getSymName() + "\t" + kept->second.getSymName()).str());
     }
   }
+  cg.replaceCallSitesWithLexMin();
+  this->numDeduped = cg.numDeduped;
   // NOTE: We do not erase the duplicated function in the pass but rely later
   // passes to cleanup. A duplicate function is not always a dead symbol as it
   // might be referenced by operations other than KGENCallOpInterface.
