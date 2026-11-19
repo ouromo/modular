@@ -1,0 +1,7 @@
+edit	result	affected functions	compiles	incremental s	full build s	same objects
+new_function	incremental	4	1	6.6	112.09	yes
+new_method	incremental	2	1	5.8	111.64	yes
+docstring_shift	incremental	2	1	5.4	110.46	yes
+comment_top	incremental	5	1	6.4	110.89	yes
+new_file	incremental	6	1	5.8	110.90	yes
+body_again	incremental	5	1	5.4	110.61	yes

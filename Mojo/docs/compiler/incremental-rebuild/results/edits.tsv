@@ -1,0 +1,13 @@
+edit	result	affected functions	compiles	incremental s	full build s	same objects
+new_function	incremental	4	1	6.7	110.70	yes
+new_import	incremental	3	1	5.5	110.92	yes
+new_file	incremental	6	1	6.0	110.66	yes
+new_method	incremental	2	1	5.8	109.32	yes
+two_files	incremental	9	1	6.7	110.39	yes
+overload	full build: the signature of a special or overloaded function changed					
+unused_addition	incremental	0	0	0.5	110.52	yes
+docstring_shift	incremental	2	1	5.5	110.59	yes
+comment_top	incremental	5	1	6.7	109.63	yes
+fields_reordered	incremental	43	2	17.4	110.27	yes
+signature_changed	incremental	4	1	6.6	110.00	yes
+constant_changed	incremental	1	1	5.4	110.36	yes
