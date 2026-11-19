@@ -946,6 +946,11 @@ static int build(const State &subcommandState) {
     KGEN::usePreviousBuildMergedFunctions(
         options.splitCachePreviousManifest + ".dup",
         options.splitCacheChangedFunctions);
+  if (!options.splitCacheManifest.empty())
+    KGEN::recordFunctionCodeHashes(
+        options.splitCachePreviousManifest.empty()
+            ? std::string()
+            : options.splitCachePreviousManifest + ".eq");
   if (llvm::opt::Arg *arg =
           args.getLastArg(options::OPT_split_cache_max_size)) {
     uint64_t megabytes = 0;

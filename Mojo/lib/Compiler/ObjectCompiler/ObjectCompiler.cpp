@@ -1823,113 +1823,74 @@ static std::string mergeIntoPreviousBuild(const CompilationOptions &options,
     if (replacement[i] >= 0)
       absent[i] = false;
 
-  // What the replaced program defines, then the objects of this build that
-  // the replacements need on top of it.
-  llvm::StringSet<> defined;
-  std::vector<size_t> todo, added;
-  llvm::DenseSet<size_t> taken;
-  auto take = [&](size_t i) {
-    for (StringRef name : fields(manifestLines[i].second))
-      defined.insert(name);
-    if (taken.insert(i).second)
-      todo.push_back(i);
-  };
-  for (auto [i, line] : llvm::enumerate(baseLines))
-    if (replacement[i] < 0 && !absent[i])
-      for (StringRef name : fields(line))
-        defined.insert(name);
+  // A full build holds exactly what `main` reaches, so the merged program is
+  // found by walking from there. A symbol comes from the previous build's
+  // object unless that object is replaced, and from this build otherwise.
+  // What the walk does not reach is left out: the objects that only the old
+  // code used, and a replacement that nothing refers to any more.
+  std::vector<bool> reached(baseLines.size(), false);
+  std::vector<bool> isReplacement(numSplits, false);
   for (int64_t i : replacement)
     if (i >= 0)
-      take(i);
+      isReplacement[i] = true;
+  llvm::DenseSet<size_t> taken;
+  std::vector<size_t> added;
+  llvm::StringSet<> absentInUse;
+  // The objects to visit: `true` with an index of the previous build,
+  // `false` with one of this build.
+  std::vector<std::pair<bool, size_t>> todo;
+  auto reach = [&](StringRef name) {
+    auto base = baseSymbol.find(name);
+    if (base != baseSymbol.end() && replacement[base->second] < 0) {
+      size_t i = base->second;
+      if (absent[i]) {
+        absentInUse.insert(name);
+      } else if (!reached[i]) {
+        reached[i] = true;
+        todo.push_back({true, i});
+      }
+      return;
+    }
+    auto sub = subSymbol.find(name);
+    if (sub == subSymbol.end())
+      return;
+    if (!taken.insert(sub->second).second)
+      return;
+    if (!isReplacement[sub->second])
+      added.push_back(sub->second);
+    todo.push_back({false, sub->second});
+  };
+  reach("main");
   while (!todo.empty()) {
-    size_t i = todo.back();
+    auto [inBase, i] = todo.back();
     todo.pop_back();
-    forEachSymbol(interfaceLines[i].second,
-                  [&](StringRef kind, StringRef, StringRef name) {
-                    if (kind != "U" || defined.contains(name))
-                      return;
-                    auto it = subSymbol.find(name);
-                    if (it == subSymbol.end())
-                      return;
-                    if (!taken.contains(it->second))
-                      added.push_back(it->second);
-                    take(it->second);
-                  });
-  }
-
-  // How many times the objects of the merged program refer to each symbol.
-  llvm::StringMap<int> uses;
-  auto countUses = [&](StringRef interfaceLine, int delta) {
-    forEachSymbol(interfaceLine, [&](StringRef kind, StringRef, StringRef name) {
+    std::string line =
+        inBase ? baseInterface(i).str() : interfaceLines[i].second;
+    forEachSymbol(line, [&](StringRef kind, StringRef, StringRef name) {
       if (kind == "U")
-        uses[name] += delta;
+        reach(name);
     });
-  };
-  for (size_t i = 0, e = baseLines.size(); i != e; ++i)
-    if (replacement[i] < 0 && !absent[i])
-      countUses(baseInterface(i), 1);
-  for (size_t i : taken)
-    countUses(interfaceLines[i].second, 1);
-  // True when no other object of the merged program refers to a symbol the
-  // previous build's object `i` defines. `counted` says whether the object's
-  // own references are in `uses`.
-  auto unused = [&](size_t i, bool counted) {
-    llvm::StringMap<int> own;
-    if (counted)
-      forEachSymbol(baseInterface(i),
-                    [&](StringRef kind, StringRef, StringRef name) {
-                      if (kind == "U")
-                        ++own[name];
-                    });
-    for (StringRef name : fields(baseLines[i]))
-      if (uses.lookup(name) > own.lookup(name))
-        return false;
-    return true;
-  };
-  for (size_t i = 0, e = baseLines.size(); i != e; ++i) {
-    if (!absent[i])
-      continue;
-    if (unused(i, /*counted=*/false))
-      dropped[i] = true;
-    else
-      countUses(baseInterface(i), 1);
   }
+  llvm::sort(added);
 
-  // A full build holds only what the program reaches. Drop the objects that
-  // were reached through the old code of the replaced and dropped objects
-  // and that nothing refers to now.
-  std::vector<size_t> candidates;
-  auto addCallees = [&](size_t i) {
-    forEachSymbol(baseInterface(i),
-                  [&](StringRef kind, StringRef, StringRef name) {
-                    auto it = baseSymbol.find(name);
-                    if (kind == "U" && it != baseSymbol.end())
-                      candidates.push_back(it->second);
-                  });
-  };
-  for (size_t i = 0, e = baseLines.size(); i != e; ++i)
-    if (replacement[i] >= 0 || dropped[i])
-      addCallees(i);
-  while (!candidates.empty()) {
-    size_t i = candidates.back();
-    candidates.pop_back();
-    if (replacement[i] >= 0 || dropped[i] || !unused(i, /*counted=*/true))
-      continue;
-    dropped[i] = true;
-    countUses(baseInterface(i), -1);
-    addCallees(i);
-  }
-
-  // A changed function that this build lacks has to be out of use now. This
-  // comes after the objects above are dropped: one of them may be its last
-  // user.
+  // A changed function that this build lacks has to be out of use now.
   std::string missing;
   for (auto &[name, i] : absentFunctions)
-    if (uses.lookup(name) > 0)
+    if (absentInUse.contains(name))
       missing += "\n  missing: " + name;
   if (!missing.empty())
     return "the partial build does not define these changed functions:" +
            missing;
+  for (size_t i = 0, e = baseLines.size(); i != e; ++i) {
+    if (replacement[i] >= 0) {
+      if (taken.contains(replacement[i]))
+        continue;
+      replacement[i] = -1;
+      dropped[i] = true;
+    } else if (!reached[i]) {
+      dropped[i] = true;
+    }
+  }
 
   // A name does not fix the calling convention: every symbol of an object
   // taken from this build must have the interface that the objects kept
@@ -2083,6 +2044,13 @@ ErrorOr<WriteableBufferRef> ObjectCompiler::linkSplitCacheObjects() {
       return Error("failed to write the manifest of the split cache");
     for (const std::string &line : KGEN::takeMergedFunctionNames())
       merged << line << '\n';
+    // A hash of the code of each function, to find the functions of a later
+    // partial build that are identical to one of this build.
+    llvm::raw_fd_ostream codes(options.splitCacheManifest + ".eq", ec);
+    if (ec)
+      return Error("failed to write the manifest of the split cache");
+    for (const std::string &line : KGEN::takeFunctionCodeHashes())
+      codes << line << '\n';
   }
   WriteableBufferRef linked = WriteableBuffer::get();
   *linked << (*fileOr)->getBuffer();

@@ -381,6 +381,14 @@ std::vector<std::string> takeMergedFunctionNames();
 void usePreviousBuildMergedFunctions(std::string mergedPath,
                                      std::string changedPath);
 
+/// Makes the duplicate function elimination record a hash of the code of
+/// each function it looked at, "NAME\tHASH". With `previousPath`, the lines
+/// of the previous build of the whole program, a partial build also merges
+/// a function with a function of the previous build that has the same code
+/// and that the partial build does not hold.
+void recordFunctionCodeHashes(std::string previousPath);
+std::vector<std::string> takeFunctionCodeHashes();
+
 } // namespace KGEN
 } // namespace M
 
